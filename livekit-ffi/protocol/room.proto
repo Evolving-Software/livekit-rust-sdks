@@ -369,8 +369,6 @@ message RoomEvent {
     ChatMessageReceived chat_message = 29;
     DataStreamHeaderReceived stream_header_received = 30;
     DataStreamChunkReceived stream_chunk_received = 31;
-    DataStreamTrailerReceived stream_trailer_received = 32;
-    DataChannelBufferedAmountLowThresholdChanged data_channel_low_threshold_changed = 33;
   }
 }
 
@@ -378,8 +376,6 @@ message RoomInfo {
   optional string sid = 1;
   required string name = 2;
   required string metadata = 3;
-  required uint64 lossy_dc_buffered_amount_low_threshold = 4;
-  required uint64 reliable_dc_buffered_amount_low_threshold = 5;
 }
 
 message OwnedRoom {
@@ -552,9 +548,9 @@ message DataStream {
 
   }
   
-  // header properties specific to byte or file streams
-  message ByteHeader {
-    required string name = 1;
+  // header properties specific to file or image streams
+  message FileHeader {
+    required string file_name = 1;  // name of the file
   }
 
   // main DataStream.Header that contains a oneof for specific headers
@@ -564,12 +560,12 @@ message DataStream {
     required string mime_type = 3;
     required string topic = 4;
     optional uint64 total_length = 5;  // only populated for finite streams, if it's a stream of unknown size this stays empty
-    map<string, string> attributes = 6;  // user defined attributes map that can carry additional info
+    map<string, string> extensions = 6;  // user defined extensions map that can carry additional info
   
     // oneof to choose between specific header types
     oneof content_header {
       TextHeader text_header = 7;
-      ByteHeader byte_header = 8;
+      FileHeader file_header = 8;
     }
   }
 
@@ -577,14 +573,9 @@ message DataStream {
     required string stream_id = 1;  // unique identifier for this data stream to map it to the correct header
     required uint64 chunk_index = 2;
     required bytes content = 3; // content as binary (bytes)
-    optional int32 version = 4; // a version indicating that this chunk_index has been retroactively modified and the original one needs to be replaced
-    optional bytes iv = 5; // optional, initialization vector for AES-GCM encryption
-  }
-
-  message Trailer {
-    required string stream_id = 1; // unique identifier for this data stream
-    required string reason = 2; // reason why the stream was closed (could contain "error" / "interrupted" / empty for expected end)
-    map<string, string> attributes = 3; // finalizing updates for the stream, can also include additional insights for errors or endTime for transcription
+    optional bool complete = 4; // true only if this is the last chunk of this stream - can also be sent with empty content
+    optional int32 version = 5; // a version indicating that this chunk_index has been retroactively modified and the original one needs to be replaced
+    optional bytes iv = 6; // optional, initialization vector for AES-GCM encryption
   }
 }
 
@@ -598,30 +589,18 @@ message DataStreamChunkReceived {
   required DataStream.Chunk chunk = 2;
 }
 
-message DataStreamTrailerReceived {
-  required string participant_identity = 1;
-  required DataStream.Trailer trailer = 2;
-}
-
 message SendStreamHeaderRequest {
   required uint64 local_participant_handle = 1;
   required DataStream.Header header = 2;
   repeated string destination_identities = 3;
-  required string sender_identity = 4;
+  optional string sender_identity = 4;
 }
 
 message SendStreamChunkRequest {
   required uint64 local_participant_handle = 1;
   required DataStream.Chunk chunk = 2;
   repeated string destination_identities = 3;
-  required string sender_identity = 4;
-}
-
-message SendStreamTrailerRequest {
-  required uint64 local_participant_handle = 1;
-  required DataStream.Trailer trailer = 2;
-  repeated string destination_identities = 3;
-  required string sender_identity = 4;
+  optional string sender_identity = 4;
 }
 
 message SendStreamHeaderResponse {
@@ -629,10 +608,6 @@ message SendStreamHeaderResponse {
 }
 
 message SendStreamChunkResponse {
-  required uint64 async_id = 1;
-}
-
-message SendStreamTrailerResponse {
   required uint64 async_id = 1;
 }
 
@@ -644,23 +619,4 @@ message SendStreamHeaderCallback {
 message SendStreamChunkCallback {
   required uint64 async_id = 1;
   optional string error = 2;
-}
-
-message SendStreamTrailerCallback {
-  required uint64 async_id = 1;
-  optional string error = 2;
-}
-
-message SetDataChannelBufferedAmountLowThresholdRequest {
-  required uint64 local_participant_handle = 1;
-  required uint64 threshold = 2;
-  required DataPacketKind kind = 3;
-}
-
-message SetDataChannelBufferedAmountLowThresholdResponse {
-}
-
-message DataChannelBufferedAmountLowThresholdChanged {
-  required DataPacketKind kind = 1;
-  required uint64 threshold = 2;
 }

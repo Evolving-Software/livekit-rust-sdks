@@ -258,16 +258,6 @@ fn on_send_stream_chunk(
     Ok(ffi_participant.room.send_stream_chunk(server, stream_chunk_message))
 }
 
-fn on_send_stream_trailer(
-    server: &'static FfiServer,
-    stream_trailer_message: proto::SendStreamTrailerRequest,
-) -> FfiResult<proto::SendStreamTrailerResponse> {
-    let ffi_participant = server
-        .retrieve_handle::<FfiParticipant>(stream_trailer_message.local_participant_handle)?
-        .clone();
-    Ok(ffi_participant.room.send_stream_trailer(server, stream_trailer_message))
-}
-
 /// Create a new video track from a source
 fn on_create_video_track(
     server: &'static FfiServer,
@@ -905,20 +895,6 @@ fn on_rpc_method_invocation_response(
     Ok(proto::RpcMethodInvocationResponseResponse { error })
 }
 
-fn on_set_data_channel_buffered_amount_low_threshold(
-    server: &'static FfiServer,
-    set_data_channel_buffered_amount_low_threshold: proto::SetDataChannelBufferedAmountLowThresholdRequest,
-) -> FfiResult<proto::SetDataChannelBufferedAmountLowThresholdResponse> {
-    let ffi_participant = server
-        .retrieve_handle::<FfiParticipant>(
-            set_data_channel_buffered_amount_low_threshold.local_participant_handle,
-        )?
-        .clone();
-    Ok(ffi_participant.room.set_data_channel_buffered_amount_low_threshold(
-        set_data_channel_buffered_amount_low_threshold,
-    ))
-}
-
 #[allow(clippy::field_reassign_with_default)] // Avoid uggly format
 pub fn handle_request(
     server: &'static FfiServer,
@@ -1086,16 +1062,6 @@ pub fn handle_request(
         }
         proto::ffi_request::Message::SendStreamChunk(request) => {
             proto::ffi_response::Message::SendStreamChunk(on_send_stream_chunk(server, request)?)
-        }
-        proto::ffi_request::Message::SendStreamTrailer(request) => {
-            proto::ffi_response::Message::SendStreamTrailer(on_send_stream_trailer(
-                server, request,
-            )?)
-        }
-        proto::ffi_request::Message::SetDataChannelBufferedAmountLowThreshold(request) => {
-            proto::ffi_response::Message::SetDataChannelBufferedAmountLowThreshold(
-                on_set_data_channel_buffered_amount_low_threshold(server, request)?,
-            )
         }
     });
 

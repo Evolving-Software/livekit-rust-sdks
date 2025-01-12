@@ -2008,8 +2008,6 @@ impl VideoRotation {
         }
     }
 }
-/// Values of this enum must not be changed
-/// It is used to serialize a rtc.VideoFrame on Python
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum VideoBufferType {
@@ -2637,7 +2635,7 @@ pub struct OwnedBuffer {
 pub struct RoomEvent {
     #[prost(uint64, required, tag="1")]
     pub room_handle: u64,
-    #[prost(oneof="room_event::Message", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33")]
+    #[prost(oneof="room_event::Message", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31")]
     pub message: ::core::option::Option<room_event::Message>,
 }
 /// Nested message and enum types in `RoomEvent`.
@@ -2707,10 +2705,6 @@ pub mod room_event {
         StreamHeaderReceived(super::DataStreamHeaderReceived),
         #[prost(message, tag="31")]
         StreamChunkReceived(super::DataStreamChunkReceived),
-        #[prost(message, tag="32")]
-        StreamTrailerReceived(super::DataStreamTrailerReceived),
-        #[prost(message, tag="33")]
-        DataChannelLowThresholdChanged(super::DataChannelBufferedAmountLowThresholdChanged),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -2722,10 +2716,6 @@ pub struct RoomInfo {
     pub name: ::prost::alloc::string::String,
     #[prost(string, required, tag="3")]
     pub metadata: ::prost::alloc::string::String,
-    #[prost(uint64, required, tag="4")]
-    pub lossy_dc_buffered_amount_low_threshold: u64,
-    #[prost(uint64, required, tag="5")]
-    pub reliable_dc_buffered_amount_low_threshold: u64,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3014,12 +3004,13 @@ pub mod data_stream {
         #[prost(bool, optional, tag="5")]
         pub generated: ::core::option::Option<bool>,
     }
-    /// header properties specific to byte or file streams
+    /// header properties specific to file or image streams
     #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct ByteHeader {
+    pub struct FileHeader {
+        /// name of the file
         #[prost(string, required, tag="1")]
-        pub name: ::prost::alloc::string::String,
+        pub file_name: ::prost::alloc::string::String,
     }
     /// main DataStream.Header that contains a oneof for specific headers
     #[allow(clippy::derive_partial_eq_without_eq)]
@@ -3038,9 +3029,9 @@ pub mod data_stream {
         /// only populated for finite streams, if it's a stream of unknown size this stays empty
         #[prost(uint64, optional, tag="5")]
         pub total_length: ::core::option::Option<u64>,
-        /// user defined attributes map that can carry additional info
+        /// user defined extensions map that can carry additional info
         #[prost(map="string, string", tag="6")]
-        pub attributes: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+        pub extensions: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
         /// oneof to choose between specific header types
         #[prost(oneof="header::ContentHeader", tags="7, 8")]
         pub content_header: ::core::option::Option<header::ContentHeader>,
@@ -3054,7 +3045,7 @@ pub mod data_stream {
             #[prost(message, tag="7")]
             TextHeader(super::TextHeader),
             #[prost(message, tag="8")]
-            ByteHeader(super::ByteHeader),
+            FileHeader(super::FileHeader),
         }
     }
     #[allow(clippy::derive_partial_eq_without_eq)]
@@ -3068,25 +3059,15 @@ pub mod data_stream {
         /// content as binary (bytes)
         #[prost(bytes="vec", required, tag="3")]
         pub content: ::prost::alloc::vec::Vec<u8>,
+        /// true only if this is the last chunk of this stream - can also be sent with empty content
+        #[prost(bool, optional, tag="4")]
+        pub complete: ::core::option::Option<bool>,
         /// a version indicating that this chunk_index has been retroactively modified and the original one needs to be replaced
-        #[prost(int32, optional, tag="4")]
+        #[prost(int32, optional, tag="5")]
         pub version: ::core::option::Option<i32>,
         /// optional, initialization vector for AES-GCM encryption
-        #[prost(bytes="vec", optional, tag="5")]
+        #[prost(bytes="vec", optional, tag="6")]
         pub iv: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
-    }
-    #[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-    pub struct Trailer {
-        /// unique identifier for this data stream
-        #[prost(string, required, tag="1")]
-        pub stream_id: ::prost::alloc::string::String,
-        /// reason why the stream was closed (could contain "error" / "interrupted" / empty for expected end)
-        #[prost(string, required, tag="2")]
-        pub reason: ::prost::alloc::string::String,
-        /// finalizing updates for the stream, can also include additional insights for errors or endTime for transcription
-        #[prost(map="string, string", tag="3")]
-        pub attributes: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     }
     /// enum for operation types (specific to TextHeader)
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
@@ -3140,14 +3121,6 @@ pub struct DataStreamChunkReceived {
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DataStreamTrailerReceived {
-    #[prost(string, required, tag="1")]
-    pub participant_identity: ::prost::alloc::string::String,
-    #[prost(message, required, tag="2")]
-    pub trailer: data_stream::Trailer,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SendStreamHeaderRequest {
     #[prost(uint64, required, tag="1")]
     pub local_participant_handle: u64,
@@ -3155,8 +3128,8 @@ pub struct SendStreamHeaderRequest {
     pub header: data_stream::Header,
     #[prost(string, repeated, tag="3")]
     pub destination_identities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, required, tag="4")]
-    pub sender_identity: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="4")]
+    pub sender_identity: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3167,20 +3140,8 @@ pub struct SendStreamChunkRequest {
     pub chunk: data_stream::Chunk,
     #[prost(string, repeated, tag="3")]
     pub destination_identities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, required, tag="4")]
-    pub sender_identity: ::prost::alloc::string::String,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SendStreamTrailerRequest {
-    #[prost(uint64, required, tag="1")]
-    pub local_participant_handle: u64,
-    #[prost(message, required, tag="2")]
-    pub trailer: data_stream::Trailer,
-    #[prost(string, repeated, tag="3")]
-    pub destination_identities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, required, tag="4")]
-    pub sender_identity: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="4")]
+    pub sender_identity: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3191,12 +3152,6 @@ pub struct SendStreamHeaderResponse {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SendStreamChunkResponse {
-    #[prost(uint64, required, tag="1")]
-    pub async_id: u64,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SendStreamTrailerResponse {
     #[prost(uint64, required, tag="1")]
     pub async_id: u64,
 }
@@ -3215,36 +3170,6 @@ pub struct SendStreamChunkCallback {
     pub async_id: u64,
     #[prost(string, optional, tag="2")]
     pub error: ::core::option::Option<::prost::alloc::string::String>,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SendStreamTrailerCallback {
-    #[prost(uint64, required, tag="1")]
-    pub async_id: u64,
-    #[prost(string, optional, tag="2")]
-    pub error: ::core::option::Option<::prost::alloc::string::String>,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetDataChannelBufferedAmountLowThresholdRequest {
-    #[prost(uint64, required, tag="1")]
-    pub local_participant_handle: u64,
-    #[prost(uint64, required, tag="2")]
-    pub threshold: u64,
-    #[prost(enumeration="DataPacketKind", required, tag="3")]
-    pub kind: i32,
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct SetDataChannelBufferedAmountLowThresholdResponse {
-}
-#[allow(clippy::derive_partial_eq_without_eq)]
-#[derive(Clone, PartialEq, ::prost::Message)]
-pub struct DataChannelBufferedAmountLowThresholdChanged {
-    #[prost(enumeration="DataPacketKind", required, tag="1")]
-    pub kind: i32,
-    #[prost(uint64, required, tag="2")]
-    pub threshold: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -4018,7 +3943,7 @@ pub struct RpcMethodInvocationEvent {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FfiRequest {
-    #[prost(oneof="ffi_request::Message", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47")]
+    #[prost(oneof="ffi_request::Message", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45")]
     pub message: ::core::option::Option<ffi_request::Message>,
 }
 /// Nested message and enum types in `FfiRequest`.
@@ -4121,18 +4046,13 @@ pub mod ffi_request {
         SendStreamHeader(super::SendStreamHeaderRequest),
         #[prost(message, tag="45")]
         SendStreamChunk(super::SendStreamChunkRequest),
-        #[prost(message, tag="46")]
-        SendStreamTrailer(super::SendStreamTrailerRequest),
-        /// Data Channel
-        #[prost(message, tag="47")]
-        SetDataChannelBufferedAmountLowThreshold(super::SetDataChannelBufferedAmountLowThresholdRequest),
     }
 }
 /// This is the output of livekit_ffi_request function.
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FfiResponse {
-    #[prost(oneof="ffi_response::Message", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46")]
+    #[prost(oneof="ffi_response::Message", tags="2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44")]
     pub message: ::core::option::Option<ffi_response::Message>,
 }
 /// Nested message and enum types in `FfiResponse`.
@@ -4233,11 +4153,6 @@ pub mod ffi_response {
         SendStreamHeader(super::SendStreamHeaderResponse),
         #[prost(message, tag="44")]
         SendStreamChunk(super::SendStreamChunkResponse),
-        #[prost(message, tag="45")]
-        SendStreamTrailer(super::SendStreamTrailerResponse),
-        /// Data Channel
-        #[prost(message, tag="46")]
-        SetDataChannelBufferedAmountLowThreshold(super::SetDataChannelBufferedAmountLowThresholdResponse),
     }
 }
 /// To minimize complexity, participant events are not included in the protocol.
@@ -4246,7 +4161,7 @@ pub mod ffi_response {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FfiEvent {
-    #[prost(oneof="ffi_event::Message", tags="1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27")]
+    #[prost(oneof="ffi_event::Message", tags="1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26")]
     pub message: ::core::option::Option<ffi_event::Message>,
 }
 /// Nested message and enum types in `FfiEvent`.
@@ -4304,8 +4219,6 @@ pub mod ffi_event {
         SendStreamHeader(super::SendStreamHeaderCallback),
         #[prost(message, tag="26")]
         SendStreamChunk(super::SendStreamChunkCallback),
-        #[prost(message, tag="27")]
-        SendStreamTrailer(super::SendStreamTrailerCallback),
     }
 }
 /// Stop all rooms synchronously (Do we need async here?).

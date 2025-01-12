@@ -1,19 +1,5 @@
 # Changelog
 
-## [0.12.8] - 2025-01-23
-
-### Changed
-
-- Rename DataStream header properties
-
-## [0.12.7] - 2025-01-17
-
-### Added
-
-- Add DataStream.Trailer support
-- Add an API to set buffer_amount_low_threshold for DataChannel
-- Update RoomInfo to contain buffer_amount_low_threshold for DataChannel
-
 ## [0.12.6] - 2025-01-07
 
 ### Fixed

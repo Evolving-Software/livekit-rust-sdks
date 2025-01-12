@@ -93,7 +93,6 @@ impl IngressClient {
                     bypass_transcoding: options.bypass_transcoding,
                     enable_transcoding: options.enable_transcoding,
                     url: options.url,
-                    enabled: Default::default(), // TODO: support this attribute
                 },
                 self.base
                     .auth_header(VideoGrants { ingress_admin: true, ..Default::default() }, None)?,
@@ -122,7 +121,6 @@ impl IngressClient {
                     video: Some(options.video),
                     bypass_transcoding: options.bypass_transcoding,
                     enable_transcoding: options.enable_transcoding,
-                    enabled: Default::default(), // TODO: support this attribute
                 },
                 self.base
                     .auth_header(VideoGrants { ingress_admin: true, ..Default::default() }, None)?,

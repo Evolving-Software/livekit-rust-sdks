@@ -252,12 +252,6 @@ impl From<&FfiRoom> for proto::RoomInfo {
             sid: room.maybe_sid().map(|x| x.to_string()),
             name: room.name(),
             metadata: room.metadata(),
-            lossy_dc_buffered_amount_low_threshold: room
-                .data_channel_options(DataPacketKind::Lossy)
-                .buffered_amount_low_threshold,
-            reliable_dc_buffered_amount_low_threshold: room
-                .data_channel_options(DataPacketKind::Reliable)
-                .buffered_amount_low_threshold,
         }
     }
 }
@@ -302,9 +296,9 @@ impl From<livekit_protocol::data_stream::Header> for proto::data_stream::Header 
                     },
                 ))
             }
-            Some(livekit_protocol::data_stream::header::ContentHeader::ByteHeader(byte_header)) => {
-                Some(proto::data_stream::header::ContentHeader::ByteHeader(
-                    proto::data_stream::ByteHeader { name: byte_header.name },
+            Some(livekit_protocol::data_stream::header::ContentHeader::FileHeader(file_header)) => {
+                Some(proto::data_stream::header::ContentHeader::FileHeader(
+                    proto::data_stream::FileHeader { file_name: file_header.file_name },
                 ))
             }
             None => None,
@@ -316,7 +310,7 @@ impl From<livekit_protocol::data_stream::Header> for proto::data_stream::Header 
             topic: msg.topic,
             mime_type: msg.mime_type,
             total_length: msg.total_length,
-            attributes: msg.attributes,
+            extensions: msg.extensions,
             content_header,
         }
     }
@@ -336,9 +330,9 @@ impl From<proto::data_stream::Header> for livekit_protocol::data_stream::Header 
                     },
                 ))
             }
-            Some(proto::data_stream::header::ContentHeader::ByteHeader(byte_header)) => {
-                Some(livekit_protocol::data_stream::header::ContentHeader::ByteHeader(
-                    livekit_protocol::data_stream::ByteHeader { name: byte_header.name },
+            Some(proto::data_stream::header::ContentHeader::FileHeader(file_header)) => {
+                Some(livekit_protocol::data_stream::header::ContentHeader::FileHeader(
+                    livekit_protocol::data_stream::FileHeader { file_name: file_header.file_name },
                 ))
             }
             None => None,
@@ -350,7 +344,8 @@ impl From<proto::data_stream::Header> for livekit_protocol::data_stream::Header 
             topic: msg.topic,
             mime_type: msg.mime_type,
             total_length: msg.total_length,
-            attributes: msg.attributes,
+            total_chunks: None,
+            extensions: msg.extensions,
             content_header,
             encryption_type: 0,
         }
@@ -362,6 +357,7 @@ impl From<livekit_protocol::data_stream::Chunk> for proto::data_stream::Chunk {
         proto::data_stream::Chunk {
             stream_id: msg.stream_id,
             content: msg.content,
+            complete: Some(msg.complete),
             chunk_index: msg.chunk_index,
             version: Some(msg.version),
             iv: msg.iv,
@@ -374,21 +370,10 @@ impl From<proto::data_stream::Chunk> for livekit_protocol::data_stream::Chunk {
         livekit_protocol::data_stream::Chunk {
             stream_id: msg.stream_id,
             content: msg.content,
+            complete: msg.complete.unwrap_or(false),
             chunk_index: msg.chunk_index,
             version: msg.version.unwrap_or(0),
             iv: msg.iv,
         }
-    }
-}
-
-impl From<livekit_protocol::data_stream::Trailer> for proto::data_stream::Trailer {
-    fn from(msg: livekit_protocol::data_stream::Trailer) -> Self {
-        Self { stream_id: msg.stream_id, reason: msg.reason, attributes: msg.attributes }
-    }
-}
-
-impl From<proto::data_stream::Trailer> for livekit_protocol::data_stream::Trailer {
-    fn from(msg: proto::data_stream::Trailer) -> Self {
-        Self { stream_id: msg.stream_id, reason: msg.reason, attributes: msg.attributes }
     }
 }

@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "*.tera": "html",
+        "cstdint": "cpp"
+    }
+}

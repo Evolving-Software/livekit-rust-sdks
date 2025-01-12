@@ -49,7 +49,6 @@ class DataChannel {
   rust::String label() const;
   DataState state() const;
   void close() const;
-  uint64_t buffered_amount() const;
 
  private:
   mutable webrtc::Mutex mutex_;

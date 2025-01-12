@@ -191,10 +191,6 @@ impl SIPClient {
                         krisp_enabled: options.krisp_enabled.unwrap_or(false),
                         max_call_duration: Self::duration_to_proto(options.max_call_duration),
                         ringing_timeout: Self::duration_to_proto(options.ringing_timeout),
-
-                        // TODO: support these attributes
-                        include_headers: Default::default(),
-                        media_encryption: Default::default(),
                     }),
                 },
                 self.base.auth_header(
@@ -232,10 +228,6 @@ impl SIPClient {
                         headers: options.headers.unwrap_or_default(),
                         headers_to_attributes: options.headers_to_attributes.unwrap_or_default(),
                         attributes_to_headers: options.attributes_to_headers.unwrap_or_default(),
-
-                        // TODO: support these attributes
-                        include_headers: Default::default(),
-                        media_encryption: Default::default(),
                     }),
                 },
                 self.base.auth_header(
@@ -257,10 +249,7 @@ impl SIPClient {
             .request(
                 SVC,
                 "ListSIPTrunk",
-                proto::ListSipTrunkRequest {
-                    // TODO support these attributes
-                    page: Default::default(),
-                },
+                proto::ListSipTrunkRequest {},
                 self.base.auth_header(
                     Default::default(),
                     Some(SIPGrants { admin: true, ..Default::default() }),
@@ -280,12 +269,7 @@ impl SIPClient {
             .request(
                 SVC,
                 "ListSIPInboundTrunk",
-                proto::ListSipInboundTrunkRequest {
-                    // TODO: support these attributes
-                    page: Default::default(),
-                    trunk_ids: Default::default(),
-                    numbers: Default::default(),
-                },
+                proto::ListSipInboundTrunkRequest {},
                 self.base.auth_header(
                     Default::default(),
                     Some(SIPGrants { admin: true, ..Default::default() }),
@@ -305,12 +289,7 @@ impl SIPClient {
             .request(
                 SVC,
                 "ListSIPOutboundTrunk",
-                proto::ListSipOutboundTrunkRequest {
-                    // TODO: support these attributes
-                    page: Default::default(),
-                    trunk_ids: Default::default(),
-                    numbers: Default::default(),
-                },
+                proto::ListSipOutboundTrunkRequest {},
                 self.base.auth_header(
                     Default::default(),
                     Some(SIPGrants { admin: true, ..Default::default() }),
@@ -353,10 +332,6 @@ impl SIPClient {
                     inbound_numbers: options.allowed_numbers.to_owned(),
                     hide_phone_number: options.hide_phone_number,
                     rule: Some(proto::SipDispatchRule { rule: Some(rule.to_owned()) }),
-
-                    // TODO: support these attributes
-                    room_preset: Default::default(),
-                    room_config: Default::default(),
                 },
                 self.base.auth_header(
                     Default::default(),
@@ -376,12 +351,7 @@ impl SIPClient {
             .request(
                 SVC,
                 "ListSIPDispatchRule",
-                proto::ListSipDispatchRuleRequest {
-                    // TODO: support these attributes
-                    page: Default::default(),
-                    dispatch_rule_ids: Default::default(),
-                    trunk_ids: Default::default(),
-                },
+                proto::ListSipDispatchRuleRequest {},
                 self.base.auth_header(
                     Default::default(),
                     Some(SIPGrants { admin: true, ..Default::default() }),
@@ -444,14 +414,7 @@ impl SIPClient {
                     hide_phone_number: options.hide_phone_number.unwrap_or(false),
                     max_call_duration: Self::duration_to_proto(options.max_call_duration),
                     ringing_timeout: Self::duration_to_proto(options.ringing_timeout),
-
-                    // TODO: rename local proto as well
-                    krisp_enabled: options.enable_krisp.unwrap_or(false),
-
-                    // TODO: support these attributes
-                    headers: Default::default(),
-                    include_headers: Default::default(),
-                    media_encryption: Default::default(),
+                    enable_krisp: options.enable_krisp.unwrap_or(false),
                 },
                 self.base.auth_header(
                     Default::default(),

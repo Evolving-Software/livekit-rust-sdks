@@ -92,10 +92,6 @@ void DataChannel::close() const {
   return data_channel_->Close();
 }
 
-uint64_t DataChannel::buffered_amount() const {
-  return data_channel_->buffered_amount();
-}
-
 NativeDataChannelObserver::NativeDataChannelObserver(
     rust::Box<DataChannelObserverWrapper> observer,
     const DataChannel* dc)
