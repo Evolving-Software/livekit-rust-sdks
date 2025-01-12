@@ -54,22 +54,37 @@ fn rename_symbols(
 }
 
 fn copy_dir(source: impl AsRef<Path>, destination: impl AsRef<Path>) -> io::Result<()> {
+    println!("Creating destination directory: {:?}", destination.as_ref());
     fs::create_dir_all(&destination)?;
+    println!("Destination directory created successfully");
+    
+    println!("Reading source directory: {:?}", source.as_ref());
     for entry in fs::read_dir(source)? {
         let entry = entry?;
+        println!("Processing entry: {:?}", entry.path());
+        
         if entry.file_type()?.is_dir() {
+            println!("Copying directory: {:?}", entry.path());
             copy_dir(entry.path(), destination.as_ref().join(entry.file_name()))?;
         } else {
+            println!("Copying file: {:?}", entry.path());
             fs::copy(entry.path(), destination.as_ref().join(entry.file_name()))?;
         }
     }
+    println!("Copy operation completed successfully");
     Ok(())
 }
 
 fn clone_if_needed(_output_dir: &PathBuf, libyuv_dir: &PathBuf) -> bool {
+    println!("Current working directory: {:?}", env::current_dir().unwrap());
+    println!("Checking if libyuv_dir exists: {:?}", libyuv_dir);
+    
     if libyuv_dir.exists() {
+        println!("libyuv_dir already exists");
         return false; // Already cloned
     }
+    
+    println!("libyuv_dir does not exist, proceeding with copy");
 
     /*let status = run_git_cmd(output_dir, &["clone", LIBYUV_REPO]);
     if !status.success() {
@@ -82,8 +97,41 @@ fn clone_if_needed(_output_dir: &PathBuf, libyuv_dir: &PathBuf) -> bool {
         fs::remove_dir_all(&libyuv_dir).unwrap();
         panic!("failed to checkout to {}", LIBYUV_COMMIT);
     }*/
-
-    if let Err(err) = copy_dir("libyuv", libyuv_dir) {
+    
+    let source_path = Path::new("./libyuv");
+    println!("Raw source path: {:?}", source_path);
+    
+    if !source_path.exists() {
+        panic!("Source directory does not exist at raw path: {:?}", source_path);
+    }
+    
+    let abs_source_path = match source_path.canonicalize() {
+        Ok(path) => path,
+        Err(e) => panic!("Failed to canonicalize path: {:?}, error: {}", source_path, e),
+    };
+    println!("Absolute source path: {:?}", abs_source_path);
+    
+    println!("Copying from: {:?}", abs_source_path);
+    println!("Copying to: {:?}", libyuv_dir);
+    
+    // Check if destination parent directory exists
+    if let Some(parent) = libyuv_dir.parent() {
+        println!("Destination parent directory: {:?}", parent);
+        println!("Parent directory exists: {}", parent.exists());
+        
+        if !parent.exists() {
+            println!("Attempting to create parent directory: {:?}", parent);
+            match fs::create_dir_all(parent) {
+                Ok(_) => println!("Successfully created parent directory"),
+                Err(e) => panic!("Failed to create parent directory: {:?}", e),
+            }
+        }
+    } else {
+        println!("No parent directory found for: {:?}", libyuv_dir);
+    }
+    
+    println!("Attempting copy operation...");
+    if let Err(err) = copy_dir(source_path, libyuv_dir) {
         fs::remove_dir_all(&libyuv_dir).unwrap();
         panic!("failed to copy libyuv: {:?}", err);
     }
