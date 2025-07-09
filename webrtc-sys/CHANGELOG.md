@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.10](https://github.com/Evolving-Software/livekit-rust-sdks/compare/rust-sdks/webrtc-sys@0.3.9...rust-sdks/webrtc-sys@0.3.10) - 2025-07-09
+
+### Other
+
+- uh huh
+- yeah baby
+- Update abseil_use_optional.patch
+
 ## [0.3.9](https://github.com/livekit/rust-sdks/compare/rust-sdks/webrtc-sys@0.3.8...rust-sdks/webrtc-sys@0.3.9) - 2025-06-17
 
 ### Other

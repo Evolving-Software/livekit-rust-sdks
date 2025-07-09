@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.1](https://github.com/Evolving-Software/livekit-rust-sdks/compare/rust-sdks/livekit-protocol@0.4.0...rust-sdks/livekit-protocol@0.4.1) - 2025-07-09
+
+### Other
+
+- yeah baby
+
 ## [0.4.0](https://github.com/livekit/rust-sdks/compare/rust-sdks/livekit-protocol@0.3.10...rust-sdks/livekit-protocol@0.4.0) - 2025-06-17
 
 ### Other
