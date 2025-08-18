@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.32](https://github.com/Evolving-Software/livekit-rust-sdks/compare/rust-sdks/livekit-ffi@0.12.31...rust-sdks/livekit-ffi@0.12.32) - 2025-08-18
+
+### Other
+
+- Update livekit-ffi/CHANGELOG.md
+- Merge remote main into livekit-main (accept remote for conflicts)
+- Update dependencies and enhance documentation for Abseil usage
+- Update build.rs
+- release
+- Update livekit/CHANGELOG.md
+
 ## [0.12.31](https://github.com/livekit/rust-sdks/compare/rust-sdks/livekit-ffi@0.12.30...rust-sdks/livekit-ffi@0.12.31) - 2025-07-31
 
 ### Other

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.6](https://github.com/Evolving-Software/livekit-rust-sdks/compare/rust-sdks/livekit-api@0.4.5...rust-sdks/livekit-api@0.4.6) - 2025-08-18
+
+### Other
+
+- Update livekit-api/CHANGELOG.md
+- Merge remote main into livekit-main (accept remote for conflicts)
+
 ## [0.4.5](https://github.com/livekit/rust-sdks/compare/rust-sdks/livekit-api@0.4.4...rust-sdks/livekit-api@0.4.5) - 2025-07-31
 
 ### Other
