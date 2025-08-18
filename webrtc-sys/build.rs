@@ -55,7 +55,7 @@ fn setup_custom_abseil() -> PathBuf {
 
     // Check if we already have the right version
     let version_file = abseil_dir.join(".version");
-    let target_version = "20240722.0";
+    let target_version = "20250814.0";
 
     let needs_download = if version_file.exists() {
         std::fs::read_to_string(&version_file)
