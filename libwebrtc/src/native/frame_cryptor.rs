@@ -1,3 +1,17 @@
+// Copyright 2025 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use std::sync::Arc;
 
 use cxx::SharedPtr;
@@ -5,11 +19,26 @@ use parking_lot::Mutex;
 use webrtc_sys::frame_cryptor::{self as sys_fc};
 
 use crate::{
-    peer_connection_factory::PeerConnectionFactory, rtp_receiver::RtpReceiver,
-    rtp_sender::RtpSender,
+    native::packet_trailer::PacketTrailerHandler, peer_connection_factory::PeerConnectionFactory,
+    rtp_receiver::RtpReceiver, rtp_sender::RtpSender,
 };
 
 pub type OnStateChange = Box<dyn FnMut(String, EncryptionState) + Send + Sync>;
+
+#[derive(Copy, Clone, Debug)]
+#[non_exhaustive]
+pub enum KeyDerivationAlgorithm {
+    PBKDF2,
+    HKDF,
+}
+impl Into<sys_fc::ffi::KeyDerivationAlgorithm> for KeyDerivationAlgorithm {
+    fn into(self) -> sys_fc::ffi::KeyDerivationAlgorithm {
+        match self {
+            KeyDerivationAlgorithm::PBKDF2 => sys_fc::ffi::KeyDerivationAlgorithm::PBKDF2,
+            KeyDerivationAlgorithm::HKDF => sys_fc::ffi::KeyDerivationAlgorithm::HKDF,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct KeyProviderOptions {
@@ -17,6 +46,8 @@ pub struct KeyProviderOptions {
     pub ratchet_window_size: i32,
     pub ratchet_salt: Vec<u8>,
     pub failure_tolerance: i32,
+    pub key_ring_size: i32,
+    pub key_derivation_algorithm: KeyDerivationAlgorithm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,6 +65,13 @@ pub enum EncryptionState {
     MissingKey,
     KeyRatcheted,
     InternalError,
+}
+
+#[derive(Debug, Clone)]
+pub struct EncryptedPacket {
+    pub data: Vec<u8>,
+    pub iv: Vec<u8>,
+    pub key_index: u32,
 }
 
 #[derive(Clone)]
@@ -147,6 +185,53 @@ impl FrameCryptor {
     pub fn on_state_change(&self, handler: Option<OnStateChange>) {
         *self.observer.state_change_handler.lock() = handler;
     }
+
+    pub fn set_packet_trailer_handler(&self, handler: &PacketTrailerHandler) {
+        self.sys_handle.set_packet_trailer_handler(handler.sys_handle());
+    }
+}
+
+#[derive(Clone)]
+pub struct DataPacketCryptor {
+    pub(crate) sys_handle: SharedPtr<sys_fc::ffi::DataPacketCryptor>,
+}
+
+impl DataPacketCryptor {
+    pub fn new(algorithm: EncryptionAlgorithm, key_provider: KeyProvider) -> Self {
+        Self {
+            sys_handle: sys_fc::ffi::new_data_packet_cryptor(
+                algorithm.into(),
+                key_provider.sys_handle,
+            ),
+        }
+    }
+
+    pub fn encrypt(
+        &self,
+        participant_id: &str,
+        key_index: u32,
+        data: &[u8],
+    ) -> Result<EncryptedPacket, Box<dyn std::error::Error>> {
+        let data_vec: Vec<u8> = data.to_vec();
+        match self.sys_handle.encrypt_data_packet(participant_id.to_string(), key_index, data_vec) {
+            Ok(packet) => Ok(packet.into()),
+            Err(e) => Err(format!("Encryption failed: {}", e).into()),
+        }
+    }
+
+    pub fn decrypt(
+        &self,
+        participant_id: &str,
+        encrypted_packet: &EncryptedPacket,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        match self
+            .sys_handle
+            .decrypt_data_packet(participant_id.to_string(), &encrypted_packet.clone().into())
+        {
+            Ok(data) => Ok(data.into_iter().collect()),
+            Err(e) => Err(format!("Decryption failed: {}", e).into()),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -208,6 +293,24 @@ impl From<KeyProviderOptions> for sys_fc::ffi::KeyProviderOptions {
             ratchet_window_size: value.ratchet_window_size,
             ratchet_salt: value.ratchet_salt,
             failure_tolerance: value.failure_tolerance,
+            key_ring_size: value.key_ring_size,
+            key_derivation_algorithm: value.key_derivation_algorithm.into(),
         }
+    }
+}
+
+impl From<sys_fc::ffi::EncryptedPacket> for EncryptedPacket {
+    fn from(value: sys_fc::ffi::EncryptedPacket) -> Self {
+        Self {
+            data: value.data.into_iter().collect(),
+            iv: value.iv.into_iter().collect(),
+            key_index: value.key_index,
+        }
+    }
+}
+
+impl From<EncryptedPacket> for sys_fc::ffi::EncryptedPacket {
+    fn from(value: EncryptedPacket) -> Self {
+        Self { data: value.data, iv: value.iv, key_index: value.key_index }
     }
 }

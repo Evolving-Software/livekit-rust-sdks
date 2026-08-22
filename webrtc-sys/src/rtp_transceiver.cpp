@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -19,7 +19,7 @@
 #include "api/peer_connection_interface.h"
 #include "api/scoped_refptr.h"
 
-namespace livekit {
+namespace livekit_ffi {
 
 webrtc::RtpTransceiverInit to_native_rtp_transceiver_init(
     RtpTransceiverInit init) {
@@ -38,8 +38,8 @@ webrtc::RtpTransceiverInit to_native_rtp_transceiver_init(
 
 RtpTransceiver::RtpTransceiver(
     std::shared_ptr<RtcRuntime> rtc_runtime,
-    rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver,
-    rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection)
+    webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver,
+    webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection)
     : rtc_runtime_(rtc_runtime),
       transceiver_(std::move(transceiver)),
       peer_connection_(std::move(peer_connection)) {}
@@ -49,9 +49,11 @@ MediaType RtpTransceiver::media_type() const {
 }
 
 rust::String RtpTransceiver::mid() const {
-  // The error/Result is converted into an Option in Rust (Wait for Option
-  // suport in cxx.rs) (value throws an error if there's no value)
-  return transceiver_->mid().value();
+  // libwebrtc is typically built with -fno-exceptions, so calling
+  // std::optional::value() on an empty optional aborts the process instead of
+  // throwing. Use value_or("") and treat empty string as "no mid yet" on the
+  // Rust side (see libwebrtc/src/native/rtp_transceiver.rs::mid).
+  return transceiver_->mid().value_or("");
 }
 
 std::shared_ptr<RtpSender> RtpTransceiver::sender() const {
@@ -151,4 +153,4 @@ void RtpTransceiver::set_header_extensions_to_negotiate(
     throw std::runtime_error(serialize_error(to_error(error)));
 }
 
-}  // namespace livekit
+}  // namespace livekit_ffi

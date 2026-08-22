@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -166,6 +166,7 @@ impl From<RtcConfiguration> for sys_pc::ffi::RtcConfiguration {
             ice_servers: value.ice_servers.into_iter().map(Into::into).collect(),
             continual_gathering_policy: value.continual_gathering_policy.into(),
             ice_transport_type: value.ice_transport_type.into(),
+            enable_sctp_snap: value.enable_sctp_snap,
         }
     }
 }

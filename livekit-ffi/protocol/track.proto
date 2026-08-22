@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -41,6 +41,7 @@ message CreateAudioTrackResponse {
 
 message GetStatsRequest {
   required uint64 track_handle = 1;
+  optional uint64 request_async_id = 2;
 }
 message GetStatsResponse {
   required uint64 async_id = 1;
@@ -90,6 +91,7 @@ message TrackPublicationInfo {
   required bool remote = 10;
   required EncryptionType encryption_type = 11;
   repeated AudioTrackFeature audio_features = 12;
+  repeated FrameMetadataFeature frame_metadata_features = 13;
 }
 
 message OwnedTrackPublication {
@@ -157,4 +159,10 @@ enum AudioTrackFeature {
   TF_NOISE_SUPPRESSION = 4;
   TF_ENHANCED_NOISE_CANCELLATION = 5;
   TF_PRECONNECT_BUFFER = 6; // client will buffer audio once available and send it to the server via bytes stream once connected
+}
+
+enum FrameMetadataFeature {
+  FMF_USER_TIMESTAMP = 0;
+  FMF_FRAME_ID = 1;
+  FMF_USER_DATA = 2;
 }

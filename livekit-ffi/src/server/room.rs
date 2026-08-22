@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,14 +16,15 @@ use std::collections::HashMap;
 use std::time::Duration;
 use std::{collections::HashSet, slice, sync::Arc};
 
-use livekit::{prelude::*, registered_audio_filter_plugins};
-use livekit::StreamReader;
+use livekit::{prelude::*, registered_audio_filter_plugins, PluginError};
+use livekit::{ChatMessage, StreamReader};
 use livekit_protocol as lk_proto;
 use parking_lot::Mutex;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
 use super::FfiDataBuffer;
+use crate::server::data_track::FfiRemoteDataTrack;
 use crate::{
     proto,
     server::data_stream::{FfiByteStreamReader, FfiTextStreamReader},
@@ -53,6 +54,12 @@ impl FfiHandle for FfiRoom {}
 pub struct FfiRoom {
     pub inner: Arc<RoomInner>,
     handle: Arc<AsyncMutex<Option<Handle>>>,
+    /// Signaled by the FFI client (via [`proto::ReadyForRoomEventRequest`]) once it
+    /// has finished installing its event listener. The connect task parks on
+    /// this notify after sending [`proto::ConnectCallback`] and only spawns the
+    /// event-forwarding tasks once it fires, ensuring no room events are
+    /// emitted before the client is ready to receive them.
+    room_event_ready_notify: Arc<Notify>,
 }
 
 pub struct RoomInner {
@@ -70,12 +77,21 @@ pub struct RoomInner {
 
     track_handle_lookup: Arc<Mutex<HashMap<TrackSid, FfiHandleId>>>,
 
+    // Maps a local publication's current sid -> its FfiPublication handle.
+    // Used to preserve the FfiPublication handle across the SDK's
+    // auto-republish during a full reconnect — the language binding can
+    // continue to use the same publication handle while the inner
+    // publication is swapped to the new (re-issued) one.
+    local_publication_lookup: Arc<Mutex<HashMap<TrackSid, FfiHandleId>>>,
+
     // Used to forward RPC method invocation to the FfiClient and collect their results
     rpc_method_invocation_waiters: Mutex<HashMap<u64, oneshot::Sender<Result<String, RpcError>>>>,
 
     // ws url associated with this room
     url: String,
 }
+
+const ROOM_EVENT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct Handle {
     event_handle: JoinHandle<()>,
@@ -116,7 +132,7 @@ impl FfiRoom {
         server: &'static FfiServer,
         connect: proto::ConnectRequest,
     ) -> proto::ConnectResponse {
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(connect.request_async_id);
 
         let req = connect.clone();
         let mut options: RoomOptions = connect.options.into();
@@ -137,22 +153,27 @@ impl FfiRoom {
                         .async_runtime
                         .spawn_blocking(move || {
                             for filter in registered_audio_filter_plugins().into_iter() {
-                                filter.on_load(&req.url, &req.token).map_err(|e| e.to_string())?;
+                                filter.on_load(&req.url, &req.token)?;
                             }
-                            Ok::<(), String>(())
+                            Ok::<(), PluginError>(())
                         })
-                        .await
-                        .map_err(|e| e.to_string());
+                        .await;
+
+                    // Filter failures are non-fatal: keep the RTC session alive, just
+                    // without the filter enabled.
                     match result {
-                        Err(e) | Ok(Err(e)) => {
-                            log::debug!("error while initializing audio filter: {}", e);
-                            log::error!(
-                                "audio filter cannot be enabled: LiveKit Cloud is required"
-                            );
-                            // Skip returning an error here to keep the rtc session alive
-                            // But in this case, the filter isn't enabled in the session.
+                        Ok(Ok(())) => (),
+                        Ok(Err(e)) => {
+                            let hint = match &e {
+                                PluginError::OnLoad(_) => " — ensure you are connecting to LiveKit Cloud and that the filter is configured correctly",
+                                PluginError::Library(_) => " — the filter dylib could not be loaded",
+                                PluginError::NotImplemented(_) => " — the filter dylib is missing a required entry point",
+                            };
+                            log::error!("audio filter disabled, continuing without it: {e}{hint}");
                         }
-                        Ok(Ok(_)) => (),
+                        Err(join_err) => {
+                            log::error!("audio filter disabled, on_load task panicked: {join_err}");
+                        }
                     };
 
                     // Successfully connected to the room
@@ -178,6 +199,7 @@ impl FfiRoom {
                         pending_published_tracks: Default::default(),
                         pending_unpublished_tracks: Default::default(),
                         track_handle_lookup: Default::default(),
+                        local_publication_lookup: Default::default(),
                         rpc_method_invocation_waiters: Default::default(),
                         url: connect.url,
                     });
@@ -186,7 +208,11 @@ impl FfiRoom {
                         build_initial_states(server, &inner, participants_with_tracks);
 
                     // Send callback
-                    let ffi_room = Self { inner: inner.clone(), handle: Default::default() };
+                    let ffi_room = Self {
+                        inner: inner.clone(),
+                        handle: Default::default(),
+                        room_event_ready_notify: Arc::new(Notify::new()),
+                    };
                     server.store_handle(ffi_room.inner.handle_id, ffi_room.clone());
 
                     // Keep the lock until the handle is "Some" (So it is OK for the client to
@@ -199,7 +225,7 @@ impl FfiRoom {
 
                     // Send the async response to the FfiClient *before* starting the tasks.
                     // Ensure no events are sent before the callback
-                    let _ = server.send_event(proto::ffi_event::Message::Connect(
+                    let _ = server.send_event(
                         proto::ConnectCallback {
                             async_id,
                             message: Some(proto::connect_callback::Message::Result(
@@ -212,22 +238,51 @@ impl FfiRoom {
                                     participants: remote_infos,
                                 },
                             )),
-                        },
-                    ));
+                        }
+                        .into(),
+                    );
 
-                    // Update Room SID on promise resolve
+                    // Wait for the FFI client to install its event listener and
+                    // send a ReadyForRoomEventRequest before forwarding any room
+                    // events. This avoids a race where events emitted between
+                    // the ConnectCallback and the listener registration are
+                    // dropped.
+                    if tokio::time::timeout(
+                        ROOM_EVENT_READY_TIMEOUT,
+                        ffi_room.room_event_ready_notify.notified(),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        let msg = format!(
+                            "timed out waiting for ReadyForRoomEventRequest after ConnectCallback \
+                             (room_handle={handle_id})"
+                        );
+                        log::error!("{}", msg);
+                        drop(handle);
+                        ffi_room.close(server, DisconnectReason::ConnectionTimeout).await;
+                        server.drop_handle(handle_id);
+                        server.send_panic(Box::new(FfiError::InvalidRequest(msg.into())));
+                        return;
+                    }
+
+                    // Update Room SID on promise resolve. Spawned after the
+                    // ready handshake so the RoomSidChanged event is never
+                    // delivered before the client is ready to receive it.
                     let room_handle = inner.handle_id.clone();
                     server.async_runtime.spawn(async move {
-                        let _ = server.send_event(proto::ffi_event::Message::RoomEvent(
+                        let _ = server.send_event(
                             proto::RoomEvent {
                                 room_handle,
-                                message: Some(proto::room_event::Message::RoomSidChanged(
+                                message: Some(
                                     proto::RoomSidChanged {
                                         sid: ffi_room.inner.room.sid().await.into(),
-                                    },
-                                )),
-                            },
-                        ));
+                                    }
+                                    .into(),
+                                ),
+                            }
+                            .into(),
+                        );
                     });
 
                     // Forward events
@@ -281,13 +336,14 @@ impl FfiRoom {
                     // Failed to connect to the room, send an error message to the FfiClient
                     // TODO(theomonnom): Typed errors?
                     log::error!("error while connecting to a room: {}", e);
-                    let _ = server.send_event(proto::ffi_event::Message::Connect(
+                    let _ = server.send_event(
                         proto::ConnectCallback {
                             async_id,
                             message: Some(proto::connect_callback::Message::Error(e.to_string())),
                             ..Default::default()
-                        },
-                    ));
+                        }
+                        .into(),
+                    );
                 }
             };
         };
@@ -296,8 +352,15 @@ impl FfiRoom {
         proto::ConnectResponse { async_id }
     }
 
+    /// Release the connect task's wait point so room event forwarding can
+    /// begin. Called in response to a [`proto::ReadyForRoomEventRequest`] from the
+    /// FFI client once it has installed its event listener.
+    pub fn ready_for_room_event(&self) {
+        self.room_event_ready_notify.notify_one();
+    }
+
     /// Close the room and stop the tasks
-    pub async fn close(&self, server: &'static FfiServer) {
+    pub async fn close(&self, server: &'static FfiServer, reason: DisconnectReason) {
         // drop associated track handles
         for (_, &handle) in self.inner.track_handle_lookup.lock().iter() {
             if server.drop_handle(handle) {
@@ -306,7 +369,7 @@ impl FfiRoom {
             }
         }
 
-        let _ = self.inner.room.close().await;
+        let _ = self.inner.room.close_with_reason(reason.into()).await;
 
         let handle = self.handle.lock().await.take();
         if let Some(handle) = handle {
@@ -333,7 +396,7 @@ impl RoomInner {
         let reliable = publish.reliable;
         let topic = publish.topic;
         let destination_identities = publish.destination_identities;
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(publish.request_async_id);
 
         if let Err(err) = self.data_tx.send(FfiDataPacket {
             payload: DataPacket {
@@ -353,7 +416,7 @@ impl RoomInner {
                     error: Some(format!("failed to send data, room closed: {}", err)),
                 };
 
-                let _ = server.send_event(proto::ffi_event::Message::PublishData(cb));
+                let _ = server.send_event(cb.into());
             });
             server.watch_panic(handle);
         }
@@ -366,7 +429,7 @@ impl RoomInner {
         server: &'static FfiServer,
         publish: proto::PublishTranscriptionRequest,
     ) -> FfiResult<proto::PublishTranscriptionResponse> {
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(publish.request_async_id);
 
         if let Err(err) = self.transcription_tx.send(FfiTranscription {
             participant_identity: publish.participant_identity,
@@ -391,7 +454,7 @@ impl RoomInner {
                     error: Some(format!("failed to send transcription, room closed: {}", err)),
                 };
 
-                let _ = server.send_event(proto::ffi_event::Message::PublishTranscription(cb));
+                let _ = server.send_event(cb.into());
             });
             server.watch_panic(handle);
         }
@@ -407,7 +470,7 @@ impl RoomInner {
         let code = publish.code;
         let digit = publish.digit;
         let destination_identities = publish.destination_identities;
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(publish.request_async_id);
 
         if let Err(err) = self.dtmf_tx.send(FfiSipDtmfPacket {
             payload: SipDTMF {
@@ -426,7 +489,7 @@ impl RoomInner {
                     error: Some(format!("failed to send SIP DTMF message, room closed: {}", err)),
                 };
 
-                let _ = server.send_event(proto::ffi_event::Message::PublishSipDtmf(cb));
+                let _ = server.send_event(cb.into());
             });
             server.watch_panic(handle);
         }
@@ -442,7 +505,7 @@ impl RoomInner {
         server: &'static FfiServer,
         publish: proto::PublishTrackRequest,
     ) -> proto::PublishTrackResponse {
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(publish.request_async_id);
         let inner = self.clone();
         server.async_runtime.spawn(async move {
             let publish_res = async {
@@ -472,7 +535,7 @@ impl RoomInner {
                     let publication_info = proto::TrackPublicationInfo::from(&ffi_publication);
                     server.store_handle(ffi_publication.handle, ffi_publication);
 
-                    let _ = server.send_event(proto::ffi_event::Message::PublishTrack(
+                    let _ = server.send_event(
                         proto::PublishTrackCallback {
                             async_id,
                             message: Some(proto::publish_track_callback::Message::Publication(
@@ -481,21 +544,23 @@ impl RoomInner {
                                     info: publication_info,
                                 },
                             )),
-                        },
-                    ));
+                        }
+                        .into(),
+                    );
 
                     inner.pending_published_tracks.lock().insert(publication.sid());
                 }
                 Err(err) => {
                     // Failed to publish the track
-                    let _ = server.send_event(proto::ffi_event::Message::PublishTrack(
+                    let _ = server.send_event(
                         proto::PublishTrackCallback {
                             async_id,
                             message: Some(proto::publish_track_callback::Message::Error(
                                 err.to_string(),
                             )),
-                        },
-                    ));
+                        }
+                        .into(),
+                    );
                 }
             }
         });
@@ -512,7 +577,7 @@ impl RoomInner {
         server: &'static FfiServer,
         unpublish: proto::UnpublishTrackRequest,
     ) -> proto::UnpublishTrackResponse {
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(unpublish.request_async_id);
         let inner = self.clone();
         let handle = server.async_runtime.spawn(async move {
             let sid = unpublish.track_sid.try_into().unwrap();
@@ -530,12 +595,13 @@ impl RoomInner {
                 }
             }
 
-            let _ = server.send_event(proto::ffi_event::Message::UnpublishTrack(
+            let _ = server.send_event(
                 proto::UnpublishTrackCallback {
                     async_id,
                     error: unpublish_res.err().map(|e| e.to_string()),
-                },
-            ));
+                }
+                .into(),
+            );
         });
         server.watch_panic(handle);
         proto::UnpublishTrackResponse { async_id }
@@ -546,18 +612,19 @@ impl RoomInner {
         server: &'static FfiServer,
         set_local_metadata: proto::SetLocalMetadataRequest,
     ) -> proto::SetLocalMetadataResponse {
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(set_local_metadata.request_async_id);
         let inner = self.clone();
         let handle = server.async_runtime.spawn(async move {
             let res =
                 inner.room.local_participant().set_metadata(set_local_metadata.metadata).await;
 
-            let _ = server.send_event(proto::ffi_event::Message::SetLocalMetadata(
+            let _ = server.send_event(
                 proto::SetLocalMetadataCallback {
                     async_id,
                     error: res.err().map(|e| e.to_string()),
-                },
-            ));
+                }
+                .into(),
+            );
         });
         server.watch_panic(handle);
         proto::SetLocalMetadataResponse { async_id }
@@ -568,14 +635,15 @@ impl RoomInner {
         server: &'static FfiServer,
         set_local_name: proto::SetLocalNameRequest,
     ) -> proto::SetLocalNameResponse {
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(set_local_name.request_async_id);
         let inner = self.clone();
         let handle = server.async_runtime.spawn(async move {
             let res = inner.room.local_participant().set_name(set_local_name.name).await;
 
-            let _ = server.send_event(proto::ffi_event::Message::SetLocalName(
-                proto::SetLocalNameCallback { async_id, error: res.err().map(|e| e.to_string()) },
-            ));
+            let _ = server.send_event(
+                proto::SetLocalNameCallback { async_id, error: res.err().map(|e| e.to_string()) }
+                    .into(),
+            );
         });
         server.watch_panic(handle);
         proto::SetLocalNameResponse { async_id }
@@ -586,7 +654,7 @@ impl RoomInner {
         server: &'static FfiServer,
         set_local_attributes: proto::SetLocalAttributesRequest,
     ) -> proto::SetLocalAttributesResponse {
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(set_local_attributes.request_async_id);
         let inner = self.clone();
         let handle = server.async_runtime.spawn(async move {
             let res = inner
@@ -601,12 +669,13 @@ impl RoomInner {
                 )
                 .await;
 
-            let _ = server.send_event(proto::ffi_event::Message::SetLocalAttributes(
+            let _ = server.send_event(
                 proto::SetLocalAttributesCallback {
                     async_id,
                     error: res.err().map(|e| e.to_string()),
-                },
-            ));
+                }
+                .into(),
+            );
         });
         server.watch_panic(handle);
         proto::SetLocalAttributesResponse { async_id }
@@ -617,7 +686,7 @@ impl RoomInner {
         server: &'static FfiServer,
         send_chat_message: proto::SendChatMessageRequest,
     ) -> proto::SendChatMessageResponse {
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(send_chat_message.request_async_id);
         let inner = self.clone();
         let handle = server.async_runtime.spawn(async move {
             let res = inner
@@ -631,24 +700,26 @@ impl RoomInner {
                 .await;
             match res {
                 Ok(message) => {
-                    let _ = server.send_event(proto::ffi_event::Message::ChatMessage(
+                    let _ = server.send_event(
                         proto::SendChatMessageCallback {
                             async_id,
                             message: Some(proto::send_chat_message_callback::Message::ChatMessage(
                                 proto::ChatMessage::from(message).into(),
                             )),
-                        },
-                    ));
+                        }
+                        .into(),
+                    );
                 }
                 Err(error) => {
-                    let _ = server.send_event(proto::ffi_event::Message::ChatMessage(
+                    let _ = server.send_event(
                         proto::SendChatMessageCallback {
                             async_id,
                             message: Some(proto::send_chat_message_callback::Message::Error(
                                 error.to_string(),
                             )),
-                        },
-                    ));
+                        }
+                        .into(),
+                    );
                 }
             }
         });
@@ -661,7 +732,7 @@ impl RoomInner {
         server: &'static FfiServer,
         edit_chat_message: proto::EditChatMessageRequest,
     ) -> proto::SendChatMessageResponse {
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(edit_chat_message.request_async_id);
         let inner = self.clone();
         let handle = server.async_runtime.spawn(async move {
             let res = inner
@@ -676,24 +747,26 @@ impl RoomInner {
                 .await;
             match res {
                 Ok(message) => {
-                    let _ = server.send_event(proto::ffi_event::Message::ChatMessage(
+                    let _ = server.send_event(
                         proto::SendChatMessageCallback {
                             async_id,
                             message: Some(proto::send_chat_message_callback::Message::ChatMessage(
                                 proto::ChatMessage::from(message).into(),
                             )),
-                        },
-                    ));
+                        }
+                        .into(),
+                    );
                 }
                 Err(error) => {
-                    let _ = server.send_event(proto::ffi_event::Message::ChatMessage(
+                    let _ = server.send_event(
                         proto::SendChatMessageCallback {
                             async_id,
                             message: Some(proto::send_chat_message_callback::Message::Error(
                                 error.to_string(),
                             )),
-                        },
-                    ));
+                        }
+                        .into(),
+                    );
                 }
             }
         });
@@ -708,6 +781,7 @@ impl RoomInner {
         server: &'static FfiServer,
         send_stream_header: proto::SendStreamHeaderRequest,
     ) -> proto::SendStreamHeaderResponse {
+        let async_id = server.resolve_async_id(send_stream_header.request_async_id);
         let packet = lk_proto::DataPacket {
             kind: proto::DataPacketKind::KindReliable.into(),
             participant_identity: send_stream_header.sender_identity,
@@ -718,7 +792,6 @@ impl RoomInner {
             .into(),
             ..Default::default()
         };
-        let async_id = server.next_id();
         let inner = self.clone();
         let handle = server.async_runtime.spawn(async move {
             let res = inner.room.local_participant().publish_raw_data(packet, true).await;
@@ -726,7 +799,7 @@ impl RoomInner {
                 async_id,
                 error: res.err().map(|e| e.to_string()),
             };
-            let _ = server.send_event(proto::ffi_event::Message::SendStreamHeader(cb));
+            let _ = server.send_event(cb.into());
         });
         server.watch_panic(handle);
         proto::SendStreamHeaderResponse { async_id }
@@ -737,6 +810,7 @@ impl RoomInner {
         server: &'static FfiServer,
         send_stream_chunk: proto::SendStreamChunkRequest,
     ) -> proto::SendStreamChunkResponse {
+        let async_id = server.resolve_async_id(send_stream_chunk.request_async_id);
         let packet = lk_proto::DataPacket {
             kind: proto::DataPacketKind::KindReliable.into(),
             participant_identity: send_stream_chunk.sender_identity,
@@ -747,7 +821,6 @@ impl RoomInner {
             .into(),
             ..Default::default()
         };
-        let async_id = server.next_id();
         let inner = self.clone();
         let handle = server.async_runtime.spawn(async move {
             let res: Result<(), RoomError> =
@@ -756,7 +829,7 @@ impl RoomInner {
                 async_id,
                 error: res.err().map(|e| e.to_string()),
             };
-            let _ = server.send_event(proto::ffi_event::Message::SendStreamChunk(cb));
+            let _ = server.send_event(cb.into());
         });
         server.watch_panic(handle);
         proto::SendStreamChunkResponse { async_id }
@@ -767,6 +840,7 @@ impl RoomInner {
         server: &'static FfiServer,
         send_stream_trailer: proto::SendStreamTrailerRequest,
     ) -> proto::SendStreamTrailerResponse {
+        let async_id = server.resolve_async_id(send_stream_trailer.request_async_id);
         let packet = lk_proto::DataPacket {
             kind: proto::DataPacketKind::KindReliable.into(),
             participant_identity: send_stream_trailer.sender_identity,
@@ -777,7 +851,6 @@ impl RoomInner {
             .into(),
             ..Default::default()
         };
-        let async_id = server.next_id();
         let inner = self.clone();
         let handle = server.async_runtime.spawn(async move {
             let res = inner.room.local_participant().publish_raw_data(packet, true).await;
@@ -785,7 +858,7 @@ impl RoomInner {
                 async_id,
                 error: res.err().map(|e| e.to_string()),
             };
-            let _ = server.send_event(proto::ffi_event::Message::SendStreamTrailer(cb));
+            let _ = server.send_event(cb.into());
         });
         server.watch_panic(handle);
         proto::SendStreamTrailerResponse { async_id }
@@ -857,7 +930,7 @@ async fn data_task(
                     error: res.err().map(|e| e.to_string()),
                 };
 
-                let _ = server.send_event(proto::ffi_event::Message::PublishData(cb));
+                let _ = server.send_event(cb.into());
             },
             _ = close_rx.recv() => {
                 break;
@@ -897,7 +970,7 @@ async fn transcription_task(
                     error: res.err().map(|e| e.to_string()),
                 };
 
-                let _ = server.send_event(proto::ffi_event::Message::PublishTranscription(cb));
+                let _ = server.send_event(cb.into());
             },
             _ = close_rx.recv() => {
                 break;
@@ -923,7 +996,7 @@ async fn sip_dtmf_task(
                     error: res.err().map(|e| e.to_string()),
                 };
 
-                let _ = server.send_event(proto::ffi_event::Message::PublishSipDtmf(cb));
+                let _ = server.send_event(cb.into());
             },
             _ = close_rx.recv() => {
                 break;
@@ -940,7 +1013,17 @@ struct ActualState {
     reconnecting: bool,
 }
 
-/// Forward events to the ffi client
+/// Wait for the next [`RoomEvent`] or a close signal, returning `None` on shutdown.
+async fn next_room_event(
+    events: &mut mpsc::UnboundedReceiver<RoomEvent>,
+    close_rx: &mut broadcast::Receiver<()>,
+) -> Option<RoomEvent> {
+    tokio::select! {
+        event = events.recv() => event,
+        _ = close_rx.recv() => None,
+    }
+}
+
 async fn room_task(
     server: &'static FfiServer,
     inner: Arc<RoomInner>,
@@ -949,38 +1032,31 @@ async fn room_task(
 ) {
     let present_state = Arc::new(Mutex::new(ActualState { reconnecting: false }));
 
-    loop {
+    while let Some(event) = next_room_event(&mut events, &mut close_rx).await {
+        let event_for_debug = event.clone();
+        let inner = inner.clone();
+        let present_state = present_state.clone();
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            forward_event(server, &inner, event, present_state).await;
+            let _ = tx.send(());
+        });
+
+        // Monitor sync/async blockings
         tokio::select! {
-            Some(event) = events.recv() => {
-                let debug = format!("{:?}", event);
-                let inner = inner.clone();
-                let present_state = present_state.clone();
-                let (tx, rx) = oneshot::channel();
-                let task = tokio::spawn(async move {
-                    forward_event(server, &inner, event, present_state).await;
-                    let _ = tx.send(());
-                });
-
-                // Monitor sync/async blockings
-                tokio::select! {
-                    _ = rx => {},
-                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                        log::error!("signal_event taking too much time: {}", debug);
-                    }
-                }
-
-                let _ = server.watch_panic(task).await;
-            },
-            _ = close_rx.recv() => {
-                break;
+            _ = rx => {},
+            _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                log::error!("signal_event taking too much time: {:?}", event_for_debug);
             }
-        };
+        }
+
+        let _ = server.watch_panic(task).await;
     }
 
-    let _ = server.send_event(proto::ffi_event::Message::RoomEvent(proto::RoomEvent {
-        room_handle: inner.handle_id,
-        message: Some(proto::room_event::Message::Eos(proto::RoomEos {})),
-    }));
+    let _ = server.send_event(
+        proto::RoomEvent { room_handle: inner.handle_id, message: Some(proto::RoomEos {}.into()) }
+            .into(),
+    );
 }
 
 async fn forward_event(
@@ -990,10 +1066,9 @@ async fn forward_event(
     present_state: Arc<Mutex<ActualState>>,
 ) {
     let send_event = |event: proto::room_event::Message| {
-        server.send_event(proto::ffi_event::Message::RoomEvent(proto::RoomEvent {
-            room_handle: inner.handle_id,
-            message: Some(event),
-        }))
+        server.send_event(
+            proto::RoomEvent { room_handle: inner.handle_id, message: Some(event) }.into(),
+        )
     };
     match event {
         RoomEvent::ParticipantConnected(participant) => {
@@ -1005,65 +1080,144 @@ async fn forward_event(
             };
             server.store_handle(handle_id, ffi_participant.clone());
 
-            let _ = send_event(proto::room_event::Message::ParticipantConnected(
+            let _ = send_event(
                 proto::ParticipantConnected {
                     info: proto::OwnedParticipant {
                         handle: proto::FfiOwnedHandle { id: handle_id },
                         info: proto::ParticipantInfo::from(&ffi_participant),
                     },
-                },
-            ));
+                }
+                .into(),
+            );
         }
         RoomEvent::ParticipantDisconnected(participant) => {
-            let _ = send_event(proto::room_event::Message::ParticipantDisconnected(
+            let _ = send_event(
                 proto::ParticipantDisconnected {
                     participant_identity: participant.identity().into(),
                     disconnect_reason: proto::DisconnectReason::from(
                         participant.disconnect_reason(),
                     )
                     .into(),
-                },
-            ));
+                }
+                .into(),
+            );
+        }
+        RoomEvent::ParticipantActive(participant) => {
+            let _ = send_event(
+                proto::ParticipantActive {
+                    participant_identity: participant.identity().to_string(),
+                }
+                .into(),
+            );
         }
         RoomEvent::LocalTrackPublished { publication, track: _, participant: _ } => {
             let sid = publication.sid();
-            // If we're currently reconnecting, users can't publish tracks, if we receive this
-            // event it means the RoomEngine is republishing tracks to finish the reconnection
-            // process. (So we're not waiting for any PublishCallback)
-            if !present_state.lock().reconnecting {
-                // Make sure to send the event *after* the async callback of the PublishTrackRequest
-                // Wait for the PublishTrack callback to be sent (waiting time is really short, so
-                // it is fine to not spawn a new task)
-                loop {
-                    if inner.pending_published_tracks.lock().remove(&sid) {
-                        break;
-                    }
-                    log::debug!("waiting for the PublishTrack callback to be sent");
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                }
+            let reconnecting = present_state.lock().reconnecting;
+            if reconnecting {
+                // The engine is auto-republishing tracks during a full
+                // reconnect. We defer the FfiPublication swap (and the
+                // proto event) to the LocalTrackRepublished handler
+                return;
             }
 
-            let ffi_publication = FfiPublication {
-                handle: server.next_id(),
-                publication: TrackPublication::Local(publication),
-            };
-            server.store_handle(ffi_publication.handle, ffi_publication);
+            // Make sure to send the event *after* the async callback of the PublishTrackRequest
+            // Wait for the PublishTrack callback to be sent (waiting time is really short, so
+            // it is fine to not spawn a new task)
+            loop {
+                if inner.pending_published_tracks.lock().remove(&sid) {
+                    break;
+                }
+                log::debug!("waiting for the PublishTrack callback to be sent");
+                tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            }
 
-            let _ = send_event(proto::room_event::Message::LocalTrackPublished(
-                proto::LocalTrackPublished { track_sid: sid.to_string() },
-            ));
+            // The PublishTrackCallback already gave the foreign side a wrapped publication
+            // handle. Allocating a second FfiPublication here would store an entry in the
+            // handle table whose id is never communicated to the client — pure leak.
+            let _ = send_event(proto::LocalTrackPublished { track_sid: sid.to_string() }.into());
         }
         RoomEvent::LocalTrackUnpublished { publication, participant: _ } => {
-            let _ = send_event(proto::room_event::Message::LocalTrackUnpublished(
-                proto::LocalTrackUnpublished { publication_sid: publication.sid().into() },
-            ));
+            let sid = publication.sid();
+            // During a reconnect, the unpublish is the SDK's internal
+            // bookkeeping for the auto-republish flow. we will ignore it here and handle it in
+            // the LocalTrackRepublished handler
+            if present_state.lock().reconnecting {
+                return;
+            }
 
-            inner.pending_unpublished_tracks.lock().insert(publication.sid());
+            inner.local_publication_lookup.lock().remove(&sid);
+            inner.pending_unpublished_tracks.lock().insert(sid.clone());
+            let _ = send_event(proto::LocalTrackUnpublished { publication_sid: sid.into() }.into());
+        }
+        RoomEvent::LocalTrackRepublished {
+            previous_sid,
+            publication,
+            track: _,
+            participant: _,
+        } => {
+            let new_sid = publication.sid();
+            let mut lookup = inner.local_publication_lookup.lock();
+            let Some(handle_id) = lookup.remove(&previous_sid) else {
+                // We never tracked an FfiPublication for this SID —
+                // shouldn't happen on the auto-republish path, but fall
+                // back to creating a fresh one so the binding still gets
+                // a usable handle.
+                let ffi_publication = FfiPublication {
+                    handle: server.next_id(),
+                    publication: TrackPublication::Local(publication),
+                };
+                let new_handle_id = ffi_publication.handle;
+                let info = proto::TrackPublicationInfo::from(&ffi_publication);
+                server.store_handle(new_handle_id, ffi_publication);
+                lookup.insert(new_sid, new_handle_id);
+                drop(lookup);
+                let _ = send_event(
+                    proto::LocalTrackRepublished {
+                        publication_handle: new_handle_id,
+                        previous_sid: previous_sid.into(),
+                        info,
+                    }
+                    .into(),
+                );
+                return;
+            };
+
+            // Swap the inner publication on the existing FfiPublication
+            // (handle id preserved); rekey the lookup under the new sid.
+            let ffi_publication = FfiPublication {
+                handle: handle_id,
+                publication: TrackPublication::Local(publication),
+            };
+            let info = proto::TrackPublicationInfo::from(&ffi_publication);
+            server.store_handle(handle_id, ffi_publication);
+            lookup.insert(new_sid, handle_id);
+            drop(lookup);
+
+            let _ = send_event(
+                proto::LocalTrackRepublished {
+                    publication_handle: handle_id,
+                    previous_sid: previous_sid.into(),
+                    info,
+                }
+                .into(),
+            );
         }
         RoomEvent::LocalTrackSubscribed { track } => {
-            let _ = send_event(proto::room_event::Message::LocalTrackSubscribed(
-                proto::LocalTrackSubscribed { track_sid: track.sid().to_string() },
-            ));
+            // During a full reconnect, the engine auto-resubscribes the
+            // republished local tracks under their new server-issued
+            // SIDs. The binding's publication object is preserved across
+            // `LocalTrackRepublished`, so the first-subscription signal
+            // it gave the application on the original publish is still
+            // valid. Forwarding this event would race with the sid
+            // rekey driven by `LocalTrackRepublished` (different task,
+            // same dispatcher channel) and surface as a KeyError /
+            // already-resolved future on the binding side.
+            if present_state.lock().reconnecting {
+                return;
+            }
+            let _ = send_event(
+                proto::LocalTrackSubscribed { track_sid: track.sid().to_string() }.into(),
+            );
         }
         RoomEvent::TrackPublished { publication, participant } => {
             let handle_id = server.next_id();
@@ -1075,20 +1229,25 @@ async fn forward_event(
             let publication_info = proto::TrackPublicationInfo::from(&ffi_publication);
             server.store_handle(ffi_publication.handle, ffi_publication);
 
-            let _ = send_event(proto::room_event::Message::TrackPublished(proto::TrackPublished {
-                participant_identity: participant.identity().to_string(),
-                publication: proto::OwnedTrackPublication {
-                    handle: proto::FfiOwnedHandle { id: handle_id },
-                    info: publication_info,
-                },
-            }));
+            let _ = send_event(
+                proto::TrackPublished {
+                    participant_identity: participant.identity().to_string(),
+                    publication: proto::OwnedTrackPublication {
+                        handle: proto::FfiOwnedHandle { id: handle_id },
+                        info: publication_info,
+                    },
+                }
+                .into(),
+            );
         }
         RoomEvent::TrackUnpublished { publication, participant } => {
-            let _ =
-                send_event(proto::room_event::Message::TrackUnpublished(proto::TrackUnpublished {
+            let _ = send_event(
+                proto::TrackUnpublished {
                     participant_identity: participant.identity().to_string(),
                     publication_sid: publication.sid().into(),
-                }));
+                }
+                .into(),
+            );
         }
         RoomEvent::TrackSubscribed { track, publication: _, participant } => {
             let handle_id = server.next_id();
@@ -1103,67 +1262,77 @@ async fn forward_event(
             server.store_handle(ffi_track.handle, ffi_track);
             inner.track_handle_lookup.lock().insert(track_sid, handle_id);
 
-            let _ =
-                send_event(proto::room_event::Message::TrackSubscribed(proto::TrackSubscribed {
+            let _ = send_event(
+                proto::TrackSubscribed {
                     participant_identity: participant.identity().to_string(),
                     track: proto::OwnedTrack {
                         handle: proto::FfiOwnedHandle { id: handle_id },
                         info: track_info,
                     },
-                }));
+                }
+                .into(),
+            );
         }
         RoomEvent::TrackUnsubscribed { track, publication: _, participant } => {
-            let _ = send_event(proto::room_event::Message::TrackUnsubscribed(
+            let _ = send_event(
                 proto::TrackUnsubscribed {
                     participant_identity: participant.identity().to_string(),
                     track_sid: track.sid().to_string(),
-                },
-            ));
+                }
+                .into(),
+            );
         }
         RoomEvent::TrackSubscriptionFailed { participant, error, track_sid } => {
-            let _ = send_event(proto::room_event::Message::TrackSubscriptionFailed(
+            let _ = send_event(
                 proto::TrackSubscriptionFailed {
                     participant_identity: participant.identity().to_string(),
                     error: error.to_string(),
                     track_sid: track_sid.into(),
-                },
-            ));
+                }
+                .into(),
+            );
         }
         RoomEvent::TrackMuted { participant, publication } => {
-            let _ = send_event(proto::room_event::Message::TrackMuted(proto::TrackMuted {
-                participant_identity: participant.identity().to_string(),
-                track_sid: publication.sid().into(),
-            }));
+            let _ = send_event(
+                proto::TrackMuted {
+                    participant_identity: participant.identity().to_string(),
+                    track_sid: publication.sid().into(),
+                }
+                .into(),
+            );
         }
         RoomEvent::TrackUnmuted { participant, publication } => {
-            let _ = send_event(proto::room_event::Message::TrackUnmuted(proto::TrackUnmuted {
-                participant_identity: participant.identity().to_string(),
-                track_sid: publication.sid().into(),
-            }));
+            let _ = send_event(
+                proto::TrackUnmuted {
+                    participant_identity: participant.identity().to_string(),
+                    track_sid: publication.sid().into(),
+                }
+                .into(),
+            );
         }
         RoomEvent::RoomMetadataChanged { old_metadata: _, metadata } => {
-            let _ = send_event(proto::room_event::Message::RoomMetadataChanged(
-                proto::RoomMetadataChanged { metadata },
-            ));
+            let _ = send_event(proto::RoomMetadataChanged { metadata }.into());
         }
         RoomEvent::ParticipantMetadataChanged { participant, old_metadata: _, metadata } => {
-            let _ = send_event(proto::room_event::Message::ParticipantMetadataChanged(
+            let _ = send_event(
                 proto::ParticipantMetadataChanged {
                     participant_identity: participant.identity().to_string(),
                     metadata,
-                },
-            ));
+                }
+                .into(),
+            );
         }
         RoomEvent::ParticipantNameChanged { participant, old_name: _, name } => {
-            let _ = send_event(proto::room_event::Message::ParticipantNameChanged(
+            let _ = send_event(
                 proto::ParticipantNameChanged {
                     participant_identity: participant.identity().to_string(),
                     name,
-                },
-            ));
+                }
+                .into(),
+            );
         }
         RoomEvent::ParticipantAttributesChanged { participant, changed_attributes } => {
-            let _ = send_event(proto::room_event::Message::ParticipantAttributesChanged(
+            let _ = send_event(
                 proto::ParticipantAttributesChanged {
                     participant_identity: participant.identity().to_string(),
                     changed_attributes: changed_attributes
@@ -1176,24 +1345,42 @@ async fn forward_event(
                         .into_iter()
                         .map(|(key, value)| proto::AttributesEntry { key, value })
                         .collect(),
-                },
-            ));
+                }
+                .into(),
+            );
+        }
+        RoomEvent::ParticipantEncryptionStatusChanged { participant, is_encrypted } => {
+            let _ = send_event(
+                proto::ParticipantEncryptionStatusChanged {
+                    participant_identity: participant.identity().to_string(),
+                    is_encrypted,
+                }
+                .into(),
+            );
+        }
+        RoomEvent::ParticipantPermissionChanged { participant, permission } => {
+            let _ = send_event(
+                proto::ParticipantPermissionChanged {
+                    participant_identity: participant.identity().to_string(),
+                    permission: permission.map(|p| (&p).into()),
+                }
+                .into(),
+            );
         }
         RoomEvent::ActiveSpeakersChanged { speakers } => {
             let participant_identities =
                 speakers.iter().map(|p| p.identity().to_string()).collect::<Vec<_>>();
 
-            let _ = send_event(proto::room_event::Message::ActiveSpeakersChanged(
-                proto::ActiveSpeakersChanged { participant_identities },
-            ));
+            let _ = send_event(proto::ActiveSpeakersChanged { participant_identities }.into());
         }
         RoomEvent::ConnectionQualityChanged { quality, participant } => {
-            let _ = send_event(proto::room_event::Message::ConnectionQualityChanged(
+            let _ = send_event(
                 proto::ConnectionQualityChanged {
                     participant_identity: participant.identity().to_string(),
                     quality: proto::ConnectionQuality::from(quality).into(),
-                },
-            ));
+                }
+                .into(),
+            );
         }
         RoomEvent::DataReceived { payload, kind, participant, topic } => {
             let handle_id = server.next_id();
@@ -1207,7 +1394,7 @@ async fn forward_event(
             };
 
             server.store_handle(handle_id, FfiDataBuffer { handle: handle_id, data: payload });
-            let _ = send_event(proto::room_event::Message::DataPacketReceived(
+            let _ = send_event(
                 proto::DataPacketReceived {
                     value: Some(proto::data_packet_received::Value::User(proto::UserPacket {
                         data: proto::OwnedBuffer {
@@ -1218,8 +1405,9 @@ async fn forward_event(
                     })),
                     participant_identity: identity,
                     kind: proto::DataPacketKind::from(kind).into(),
-                },
-            ));
+                }
+                .into(),
+            );
         }
         RoomEvent::TranscriptionReceived { participant, track_publication, segments } => {
             let segments = segments
@@ -1242,16 +1430,16 @@ async fn forward_event(
                 Some(p) => Some(p.identity().to_string()),
                 None => None,
             };
-            let _ = send_event(proto::room_event::Message::TranscriptionReceived(
-                proto::TranscriptionReceived { participant_identity, segments, track_sid },
-            ));
+            let _ = send_event(
+                proto::TranscriptionReceived { participant_identity, segments, track_sid }.into(),
+            );
         }
         RoomEvent::SipDTMFReceived { code, digit, participant } => {
             let (_sid, identity) = match participant {
                 Some(p) => (Some(p.sid().to_string()), p.identity().to_string()),
                 None => (None, String::new()),
             };
-            let _ = send_event(proto::room_event::Message::DataPacketReceived(
+            let _ = send_event(
                 proto::DataPacketReceived {
                     value: Some(proto::data_packet_received::Value::SipDtmf(proto::SipDtmf {
                         code,
@@ -1259,8 +1447,9 @@ async fn forward_event(
                     })),
                     participant_identity: identity,
                     kind: proto::DataPacketKind::KindReliable.into(),
-                },
-            ));
+                }
+                .into(),
+            );
         }
 
         RoomEvent::ChatMessage { message, participant } => {
@@ -1268,40 +1457,45 @@ async fn forward_event(
                 Some(p) => (Some(p.sid().to_string()), p.identity().to_string()),
                 None => (None, String::new()),
             };
-            let _ =
-                send_event(proto::room_event::Message::ChatMessage(proto::ChatMessageReceived {
+            let _ = send_event(
+                proto::ChatMessageReceived {
                     message: proto::ChatMessage::from(message).into(),
                     participant_identity: identity,
-                }));
+                }
+                .into(),
+            );
         }
 
         RoomEvent::ConnectionStateChanged(state) => {
-            let _ = send_event(proto::room_event::Message::ConnectionStateChanged(
-                proto::ConnectionStateChanged { state: proto::ConnectionState::from(state).into() },
-            ));
+            let _ = send_event(
+                proto::ConnectionStateChanged { state: proto::ConnectionState::from(state).into() }
+                    .into(),
+            );
         }
         RoomEvent::Connected { .. } => {
             // Ignore here, we're already sent the event on connect (see above)
         }
         RoomEvent::Disconnected { reason } => {
-            let _ = send_event(proto::room_event::Message::Disconnected(proto::Disconnected {
-                reason: proto::DisconnectReason::from(reason).into(),
-            }));
+            let _ = send_event(
+                proto::Disconnected { reason: proto::DisconnectReason::from(reason).into() }.into(),
+            );
         }
         RoomEvent::Reconnecting => {
             present_state.lock().reconnecting = true;
-            let _ = send_event(proto::room_event::Message::Reconnecting(proto::Reconnecting {}));
+            let _ = send_event(proto::Reconnecting {}.into());
         }
         RoomEvent::Reconnected => {
             present_state.lock().reconnecting = false;
-            let _ = send_event(proto::room_event::Message::Reconnected(proto::Reconnected {}));
+            let _ = send_event(proto::Reconnected {}.into());
         }
         RoomEvent::E2eeStateChanged { participant, state } => {
-            let _ =
-                send_event(proto::room_event::Message::E2eeStateChanged(proto::E2eeStateChanged {
+            let _ = send_event(
+                proto::E2eeStateChanged {
                     participant_identity: participant.identity().to_string(),
                     state: proto::EncryptionState::from(state).into(),
-                }));
+                }
+                .into(),
+            );
         }
         RoomEvent::ByteStreamOpened { reader, topic: _, participant_identity } => {
             let Some(reader) = reader.take() else { return };
@@ -1310,14 +1504,16 @@ async fn forward_event(
             let ffi_reader = FfiByteStreamReader { handle_id, inner: reader };
             server.store_handle(ffi_reader.handle_id, ffi_reader);
 
-            let _ =
-                send_event(proto::room_event::Message::ByteStreamOpened(proto::ByteStreamOpened {
+            let _ = send_event(
+                proto::ByteStreamOpened {
                     reader: proto::OwnedByteStreamReader {
                         handle: proto::FfiOwnedHandle { id: handle_id },
                         info: info.into(),
                     },
                     participant_identity: participant_identity.0,
-                }));
+                }
+                .into(),
+            );
         }
         RoomEvent::TextStreamOpened { reader, topic: _, participant_identity } => {
             let Some(reader) = reader.take() else { return };
@@ -1326,37 +1522,42 @@ async fn forward_event(
             let ffi_reader = FfiTextStreamReader { handle_id, inner: reader };
             server.store_handle(ffi_reader.handle_id, ffi_reader);
 
-            let _ =
-                send_event(proto::room_event::Message::TextStreamOpened(proto::TextStreamOpened {
+            let _ = send_event(
+                proto::TextStreamOpened {
                     reader: proto::OwnedTextStreamReader {
                         handle: proto::FfiOwnedHandle { id: handle_id },
                         info: info.into(),
                     },
                     participant_identity: participant_identity.0,
-                }));
+                }
+                .into(),
+            );
         }
         RoomEvent::StreamHeaderReceived { header, participant_identity } => {
-            let _ = send_event(proto::room_event::Message::StreamHeaderReceived(
-                proto::DataStreamHeaderReceived { header: header.into(), participant_identity },
-            ));
+            let _ = send_event(
+                proto::DataStreamHeaderReceived { header: header.into(), participant_identity }
+                    .into(),
+            );
         }
         RoomEvent::StreamChunkReceived { chunk, participant_identity } => {
-            let _ = send_event(proto::room_event::Message::StreamChunkReceived(
-                proto::DataStreamChunkReceived { chunk: chunk.into(), participant_identity },
-            ));
+            let _ = send_event(
+                proto::DataStreamChunkReceived { chunk: chunk.into(), participant_identity }.into(),
+            );
         }
         RoomEvent::StreamTrailerReceived { trailer, participant_identity } => {
-            let _ = send_event(proto::room_event::Message::StreamTrailerReceived(
-                proto::DataStreamTrailerReceived { trailer: trailer.into(), participant_identity },
-            ));
+            let _ = send_event(
+                proto::DataStreamTrailerReceived { trailer: trailer.into(), participant_identity }
+                    .into(),
+            );
         }
         RoomEvent::DataChannelBufferedAmountLowThresholdChanged { kind, threshold } => {
-            let _ = send_event(proto::room_event::Message::DataChannelLowThresholdChanged(
+            let _ = send_event(
                 proto::DataChannelBufferedAmountLowThresholdChanged {
                     kind: proto::DataPacketKind::from(kind).into(),
                     threshold,
-                },
-            ));
+                }
+                .into(),
+            );
         }
         RoomEvent::RoomUpdated { room } => {
             let _ = send_event(proto::room_event::Message::RoomUpdated(room.into()));
@@ -1365,14 +1566,25 @@ async fn forward_event(
             let _ = send_event(proto::room_event::Message::Moved(room.into()));
         }
         RoomEvent::ParticipantsUpdated { participants } => {
-            let _ = send_event(proto::room_event::Message::ParticipantsUpdated(
+            let _ = send_event(
                 proto::ParticipantsUpdated {
                     participants: participants
                         .into_iter()
                         .map(|p| proto::ParticipantInfo::from(&p))
                         .collect(),
-                },
-            ));
+                }
+                .into(),
+            );
+        }
+        RoomEvent::TokenRefreshed { token } => {
+            let _ = send_event(proto::TokenRefreshed { token: token.into() }.into());
+        }
+        RoomEvent::DataTrackPublished(track) => {
+            let track = FfiRemoteDataTrack::from_track(server, track);
+            let _ = send_event(proto::DataTrackPublished { track }.into());
+        }
+        RoomEvent::DataTrackUnpublished(sid) => {
+            let _ = send_event(proto::DataTrackUnpublished { sid: sid.to_string() }.into());
         }
         _ => {
             log::warn!("unhandled room event: {:?}", event);
@@ -1443,4 +1655,25 @@ fn build_initial_states(
         },
         remote_infos,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn closed_event_channel_ends_room_event_stream() {
+        let (event_tx, mut events) = mpsc::unbounded_channel();
+        let (_close_tx, mut close_rx) = broadcast::channel(1);
+        drop(event_tx);
+
+        let event = tokio::time::timeout(
+            Duration::from_secs(1),
+            next_room_event(&mut events, &mut close_rx),
+        )
+        .await
+        .expect("closed room event channel should end the event stream");
+
+        assert!(event.is_none());
+    }
 }

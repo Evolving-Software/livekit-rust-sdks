@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,12 +24,14 @@ import "track.proto";
 import "video_frame.proto";
 import "stats.proto";
 import "data_stream.proto";
+import "data_track.proto";
 
 // Connect to a new LiveKit room
 message ConnectRequest {
   required string url = 1;
   required string token = 2;
   required RoomOptions options = 3;
+  optional uint64 request_async_id = 4;
 }
 message ConnectResponse {
   required uint64 async_id = 1;
@@ -58,15 +60,52 @@ message ConnectCallback {
 }
 
 // Disconnect from the a room
-message DisconnectRequest { required uint64 room_handle = 1; }
+message DisconnectRequest {
+  required uint64 room_handle = 1;
+  optional uint64 request_async_id = 2;
+  optional DisconnectReason reason = 3;
+}
 message DisconnectResponse { required uint64 async_id = 1; }
 message DisconnectCallback { required uint64 async_id = 1; }
+
+// Simulate a reconnection scenario for testing. Mirrors the variants of
+// `livekit::SimulateScenario`. The Resume / FullReconnect variants are
+// the relevant ones for verifying that resume preserves publications and
+// full reconnect republishes them exactly once.
+enum SimulateScenarioKind {
+  // Closes the signal channel locally; engine attempts a Resume.
+  SIMULATE_SIGNAL_RECONNECT = 0;
+  SIMULATE_SPEAKER = 1;
+  SIMULATE_NODE_FAILURE = 2;
+  SIMULATE_SERVER_LEAVE = 3;
+  SIMULATE_MIGRATION = 4;
+  SIMULATE_FORCE_TCP = 5;
+  SIMULATE_FORCE_TLS = 6;
+  // Asks the server to send `LeaveRequest{Reconnect}`, forcing a full
+  // reconnect (new RtcSession; SDK republishes existing local tracks).
+  SIMULATE_FULL_RECONNECT = 7;
+  // Asks the server to drop the signalling connection during the next resume,
+  // then triggers a resume locally. The resume cannot complete, so the engine
+  // escalates to a full reconnect — exercising the resume→full escalation path.
+  SIMULATE_DISCONNECT_SIGNAL_ON_RESUME = 8;
+}
+message SimulateScenarioRequest {
+  required uint64 room_handle = 1;
+  required SimulateScenarioKind scenario = 2;
+  optional uint64 request_async_id = 3;
+}
+message SimulateScenarioResponse { required uint64 async_id = 1; }
+message SimulateScenarioCallback {
+  required uint64 async_id = 1;
+  optional string error = 2;
+}
 
 // Publish a track to the room
 message PublishTrackRequest {
   required uint64 local_participant_handle = 1;
   required uint64 track_handle = 2;
   required TrackPublishOptions options = 3;
+  optional uint64 request_async_id = 4;
 }
 message PublishTrackResponse {
   required uint64 async_id = 1;
@@ -80,11 +119,17 @@ message PublishTrackCallback {
 
 }
 
+message ReadyForRoomEventRequest {
+  required uint64 room_handle = 1;
+}
+message ReadyForRoomEventResponse {}
+
 // Unpublish a track from the room
 message UnpublishTrackRequest {
   required uint64 local_participant_handle = 1;
   required string track_sid = 2;
   required bool stop_on_unpublish = 3;
+  optional uint64 request_async_id = 4;
 }
 message UnpublishTrackResponse {
   required uint64 async_id = 1;
@@ -103,6 +148,7 @@ message PublishDataRequest {
   repeated string destination_sids = 5 [deprecated=true];
   optional string topic = 6;
   repeated string destination_identities = 7;
+  optional uint64 request_async_id = 8;
 }
 message PublishDataResponse {
   required uint64 async_id = 1;
@@ -118,6 +164,7 @@ message PublishTranscriptionRequest {
   required string participant_identity = 2;
   required string track_id = 3;
   repeated TranscriptionSegment segments = 4;
+  optional uint64 request_async_id = 5;
 }
 message PublishTranscriptionResponse {
   required uint64 async_id = 1;
@@ -133,6 +180,7 @@ message PublishSipDtmfRequest {
   required uint32 code = 2;
   required string digit = 3;
   repeated string destination_identities = 4;
+  optional uint64 request_async_id = 5;
 }
 message PublishSipDtmfResponse {
   required uint64 async_id = 1;
@@ -146,6 +194,7 @@ message PublishSipDtmfCallback {
 message SetLocalMetadataRequest {
   required uint64 local_participant_handle = 1;
   required string metadata = 2;
+  optional uint64 request_async_id = 3;
 }
 message SetLocalMetadataResponse {
   required uint64 async_id = 1;
@@ -160,6 +209,7 @@ message SendChatMessageRequest {
   required string message = 2;
   repeated string destination_identities = 3;
   optional string sender_identity = 4;
+  optional uint64 request_async_id = 5;
 }
 message EditChatMessageRequest {
   required uint64 local_participant_handle = 1;
@@ -167,6 +217,7 @@ message EditChatMessageRequest {
   required ChatMessage original_message = 3;
   repeated string destination_identities = 4;
   optional string sender_identity = 5;
+  optional uint64 request_async_id = 6;
 }
 message SendChatMessageResponse {
   required uint64 async_id = 1;
@@ -183,6 +234,7 @@ message SendChatMessageCallback {
 message SetLocalAttributesRequest {
   required uint64 local_participant_handle = 1;
   repeated AttributesEntry attributes = 2;
+  optional uint64 request_async_id = 3;
 }
 
 message AttributesEntry {
@@ -202,6 +254,7 @@ message SetLocalAttributesCallback {
 message SetLocalNameRequest {
   required uint64 local_participant_handle = 1;
   required string name = 2;
+  optional uint64 request_async_id = 3;
 }
 message SetLocalNameResponse {
   required uint64 async_id = 1;
@@ -220,6 +273,7 @@ message SetSubscribedResponse {}
 
 message GetSessionStatsRequest {
   required uint64 room_handle = 1;
+  optional uint64 request_async_id = 2;
 }
 message GetSessionStatsResponse {
   required uint64 async_id = 1;
@@ -261,6 +315,39 @@ message TrackPublishOptions {
   optional bool simulcast = 6;
   optional TrackSource source = 7;
   optional string stream = 8;
+  optional bool preconnect_buffer = 9;
+  repeated FrameMetadataFeature frame_metadata_features = 10;
+  // RTP scalability mode (e.g. "L3T3_KEY"). When set, a single RTP
+  // encoding is produced with this mode, enabling true SVC for codecs
+  // that support it (VP9, AV1). Has no effect for VP8/H264.
+  optional string scalability_mode = 11;
+  // Preferred encoder backend to use when publishing a video track.
+  optional VideoEncoderBackend video_encoder = 12;
+  // Controls how the encoder trades off between resolution and framerate
+  // when bandwidth is constrained. Default is MAINTAIN_RESOLUTION.
+  optional DegradationPreference degradation_preference = 13;
+}
+
+enum VideoEncoderBackend {
+  ENCODER_BACKEND_AUTO = 0;
+  ENCODER_BACKEND_SOFTWARE = 1;
+  ENCODER_BACKEND_HARDWARE = 2;
+  ENCODER_BACKEND_NVENC = 3;
+  ENCODER_BACKEND_VAAPI = 4;
+  ENCODER_BACKEND_VIDEOTOOLBOX = 5;
+}
+
+// Controls how the encoder degrades quality when bandwidth is constrained.
+enum DegradationPreference {
+  // Balance between framerate and resolution degradation.
+  DEGRADATION_PREFERENCE_BALANCED = 0;
+  // Degrade framerate to maintain resolution.
+  DEGRADATION_PREFERENCE_MAINTAIN_FRAMERATE = 1;
+  // Degrade resolution to maintain framerate (drop frames to keep clarity).
+  DEGRADATION_PREFERENCE_MAINTAIN_RESOLUTION = 2;
+  // Maintain both framerate and resolution. Frames may be dropped before encoding
+  // if necessary to avoid overusing network and encoder resources.
+  DEGRADATION_PREFERENCE_MAINTAIN_FRAMERATE_AND_RESOLUTION = 4;
 }
 
 enum IceTransportType {
@@ -286,13 +373,36 @@ message RtcConfig {
   repeated IceServer ice_servers = 3; // empty fallback to default
 }
 
+// Options controlling data stream behavior for the room.
+message RoomDataStreamOptions {
+  // Maximum decompressed payload size in bytes accepted for a single incoming
+  // data stream. Streams exceeding this limit terminate with an error on the
+  // receiving side. Unset falls back to the SDK default.
+  optional uint64 max_payload_byte_length = 1;
+  // Temporary migration aid for SDKs that still implement data streams in
+  // their own client-side code on top of the FFI instead of using the FFI
+  // data stream API. When true, this client does not advertise data streams
+  // v2 support: ClientInfo.client_protocol is capped at 1 (DATA_STREAM_RPC),
+  // so remote clients will not use v2-only behavior toward this client.
+  // Defaults to false (v2 advertised). Will be removed once all FFI
+  // consumers migrate.
+  optional bool use_legacy_client_implementation = 2;
+}
+
 message RoomOptions {
   optional bool auto_subscribe = 1;
   optional bool adaptive_stream = 2;
   optional bool dynacast = 3;
-  optional E2eeOptions e2ee = 4;
+  optional E2eeOptions e2ee = 4 [deprecated=true];
   optional RtcConfig rtc_config = 5; // allow to setup a custom RtcConfiguration
   optional uint32 join_retries = 6;
+  optional E2eeOptions encryption = 7;
+  optional bool single_peer_connection = 8; // use single peer connection for both publish/subscribe (default: false)
+  optional uint64 connect_timeout_ms = 9; // timeout in milliseconds for each signal connection attempt (default: 5000)
+  optional RoomDataStreamOptions data_stream = 10; // data stream behavior for this room
+  // Comma separated list of additional LiveKit SDKs layered on top of this one, with versions,
+  // e.g. "components-js:1.2.3,track-processors-js:1.2.3". Forwarded to ClientInfo.other_sdks.
+  optional string other_sdks = 11;
 }
 
 //
@@ -382,6 +492,13 @@ message RoomEvent {
     RoomInfo moved = 37;
     // carry over all participant info updates, including sid
     ParticipantsUpdated participants_updated = 38;
+    ParticipantEncryptionStatusChanged participant_encryption_status_changed = 39;
+    ParticipantPermissionChanged participant_permission_changed = 41;
+    TokenRefreshed token_refreshed = 40;
+    ParticipantActive participant_active = 42;
+    DataTrackPublished data_track_published = 43;
+    DataTrackUnpublished data_track_unpublished = 44;
+    LocalTrackRepublished local_track_republished = 45;
   }
 }
 
@@ -411,6 +528,10 @@ message ParticipantsUpdated {
 
 message ParticipantConnected { required OwnedParticipant info = 1; }
 
+message ParticipantActive {
+  required string participant_identity = 1;
+}
+
 message ParticipantDisconnected {
   required string participant_identity = 1;
   required DisconnectReason disconnect_reason = 2;
@@ -424,6 +545,19 @@ message LocalTrackPublished {
 
 message LocalTrackUnpublished {
   required string publication_sid = 1;
+}
+
+// Fired when the SDK auto-republishes a local track during a full
+// reconnect. The FfiPublication handle is preserved across the cycle —
+// language bindings should look up the existing publication object by
+// `previous_sid` (its old SID), update its TrackPublicationInfo in place
+// with `info`, and rekey it under the new SID. Apps holding a cached
+// reference to the publication continue to see a valid object whose
+// reads/writes hit current state.
+message LocalTrackRepublished {
+  required uint64 publication_handle = 1;
+  required string previous_sid = 2;
+  required TrackPublicationInfo info = 3;
 }
 
 message LocalTrackSubscribed {
@@ -495,9 +629,19 @@ message ParticipantAttributesChanged {
   repeated AttributesEntry changed_attributes = 3;
 }
 
+message ParticipantEncryptionStatusChanged {
+  required string participant_identity = 1;
+  required bool is_encrypted = 2;
+}
+
 message ParticipantNameChanged {
   required string participant_identity = 1;
   required string name = 2;
+}
+
+message ParticipantPermissionChanged {
+  required string participant_identity = 1;
+  optional ParticipantPermission permission = 2;
 }
 
 message ConnectionQualityChanged {
@@ -552,6 +696,10 @@ message Disconnected {
 }
 message Reconnecting {}
 message Reconnected {}
+
+message TokenRefreshed {
+  required string token = 1;
+}
 
 message RoomEOS {}
 
@@ -631,6 +779,7 @@ message SendStreamHeaderRequest {
   required DataStream.Header header = 2;
   repeated string destination_identities = 3;
   required string sender_identity = 4;
+  optional uint64 request_async_id = 5;
 }
 
 message SendStreamChunkRequest {
@@ -638,6 +787,7 @@ message SendStreamChunkRequest {
   required DataStream.Chunk chunk = 2;
   repeated string destination_identities = 3;
   required string sender_identity = 4;
+  optional uint64 request_async_id = 5;
 }
 
 message SendStreamTrailerRequest {
@@ -645,6 +795,7 @@ message SendStreamTrailerRequest {
   required DataStream.Trailer trailer = 2;
   repeated string destination_identities = 3;
   required string sender_identity = 4;
+  optional uint64 request_async_id = 5;
 }
 
 message SendStreamHeaderResponse {
@@ -696,4 +847,15 @@ message ByteStreamOpened {
 message TextStreamOpened {
   required OwnedTextStreamReader reader = 1;
   required string participant_identity = 2;
+}
+
+// A remote participant published a data track.
+message DataTrackPublished {
+  required OwnedRemoteDataTrack track = 1;
+}
+
+// A remote participant unpublished a data track.
+message DataTrackUnpublished {
+  // SID of the track that was unpublished.
+  required string sid = 1;
 }

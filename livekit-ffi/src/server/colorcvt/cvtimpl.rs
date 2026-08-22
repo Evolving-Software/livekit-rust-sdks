@@ -1,3 +1,17 @@
+// Copyright 2025 LiveKit, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use super::*;
 use crate::proto;
 use crate::{FfiError, FfiResult};
@@ -170,6 +184,91 @@ pub unsafe fn cvt_argb(
             Err(FfiError::InvalidRequest(format!("argb to {:?} is not supported", dst_type).into()))
         }
     }
+}
+
+pub unsafe fn cvt_rgba_to_i420_buffer(
+    buffer: proto::VideoBufferInfo,
+    flip_y: bool,
+) -> BoxVideoBuffer {
+    assert_eq!(buffer.r#type(), proto::VideoBufferType::Rgba);
+    let proto::VideoBufferInfo { stride, width, height, data_ptr, .. } = buffer;
+    let stride = stride.unwrap_or(width * 4);
+    let data = unsafe { slice::from_raw_parts(data_ptr as *const u8, (stride * height) as usize) };
+    let chroma_w = (width + 1) / 2;
+    let mut i420 = I420Buffer::with_strides(width, height, width, chroma_w, chroma_w);
+    let (dst_y, dst_u, dst_v) = i420.data_mut();
+    colorcvt::abgr_to_i420(
+        data, stride, dst_y, width, dst_u, chroma_w, dst_v, chroma_w, width, height, flip_y,
+    );
+    Box::new(i420) as BoxVideoBuffer
+}
+
+pub unsafe fn cvt_abgr_to_i420_buffer(
+    buffer: proto::VideoBufferInfo,
+    flip_y: bool,
+) -> BoxVideoBuffer {
+    assert_eq!(buffer.r#type(), proto::VideoBufferType::Abgr);
+    let proto::VideoBufferInfo { stride, width, height, data_ptr, .. } = buffer;
+    let stride = stride.unwrap_or(width * 4);
+    let data = unsafe { slice::from_raw_parts(data_ptr as *const u8, (stride * height) as usize) };
+    let chroma_w = (width + 1) / 2;
+    let mut i420 = I420Buffer::with_strides(width, height, width, chroma_w, chroma_w);
+    let (dst_y, dst_u, dst_v) = i420.data_mut();
+    colorcvt::rgba_to_i420(
+        data, stride, dst_y, width, dst_u, chroma_w, dst_v, chroma_w, width, height, flip_y,
+    );
+    Box::new(i420) as BoxVideoBuffer
+}
+
+pub unsafe fn cvt_argb_to_i420_buffer(
+    buffer: proto::VideoBufferInfo,
+    flip_y: bool,
+) -> BoxVideoBuffer {
+    assert_eq!(buffer.r#type(), proto::VideoBufferType::Argb);
+    let proto::VideoBufferInfo { stride, width, height, data_ptr, .. } = buffer;
+    let stride = stride.unwrap_or(width * 4);
+    let data = unsafe { slice::from_raw_parts(data_ptr as *const u8, (stride * height) as usize) };
+    let chroma_w = (width + 1) / 2;
+    let mut i420 = I420Buffer::with_strides(width, height, width, chroma_w, chroma_w);
+    let (dst_y, dst_u, dst_v) = i420.data_mut();
+    colorcvt::bgra_to_i420(
+        data, stride, dst_y, width, dst_u, chroma_w, dst_v, chroma_w, width, height, flip_y,
+    );
+    Box::new(i420) as BoxVideoBuffer
+}
+
+pub unsafe fn cvt_bgra_to_i420_buffer(
+    buffer: proto::VideoBufferInfo,
+    flip_y: bool,
+) -> BoxVideoBuffer {
+    assert_eq!(buffer.r#type(), proto::VideoBufferType::Bgra);
+    let proto::VideoBufferInfo { stride, width, height, data_ptr, .. } = buffer;
+    let stride = stride.unwrap_or(width * 4);
+    let data = unsafe { slice::from_raw_parts(data_ptr as *const u8, (stride * height) as usize) };
+    let chroma_w = (width + 1) / 2;
+    let mut i420 = I420Buffer::with_strides(width, height, width, chroma_w, chroma_w);
+    let (dst_y, dst_u, dst_v) = i420.data_mut();
+    colorcvt::argb_to_i420(
+        data, stride, dst_y, width, dst_u, chroma_w, dst_v, chroma_w, width, height, flip_y,
+    );
+    Box::new(i420) as BoxVideoBuffer
+}
+
+pub unsafe fn cvt_rgb24_to_i420_buffer(
+    buffer: proto::VideoBufferInfo,
+    flip_y: bool,
+) -> BoxVideoBuffer {
+    assert_eq!(buffer.r#type(), proto::VideoBufferType::Rgb24);
+    let proto::VideoBufferInfo { stride, width, height, data_ptr, .. } = buffer;
+    let stride = stride.unwrap_or(width * 3);
+    let data = unsafe { slice::from_raw_parts(data_ptr as *const u8, (stride * height) as usize) };
+    let chroma_w = (width + 1) / 2;
+    let mut i420 = I420Buffer::with_strides(width, height, width, chroma_w, chroma_w);
+    let (dst_y, dst_u, dst_v) = i420.data_mut();
+    colorcvt::raw_to_i420(
+        data, stride, dst_y, width, dst_u, chroma_w, dst_v, chroma_w, width, height, flip_y,
+    );
+    Box::new(i420) as BoxVideoBuffer
 }
 
 pub unsafe fn cvt_bgra(

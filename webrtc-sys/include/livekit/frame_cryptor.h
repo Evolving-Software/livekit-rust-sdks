@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -32,12 +32,14 @@
 #include "rtc_base/synchronization/mutex.h"
 #include "rust/cxx.h"
 
-namespace livekit {
+namespace livekit_ffi {
 
 struct KeyProviderOptions;
+struct EncryptedPacket;
 enum class Algorithm : ::std::int32_t;
 class RtcFrameCryptorObserverWrapper;
 class NativeFrameCryptorObserver;
+class PacketTrailerHandler;
 
 /// Shared secret key for frame encryption.
 class KeyProvider {
@@ -116,10 +118,10 @@ class KeyProvider {
     impl_->SetSifTrailer(trailer_vec);
   }
 
-  rtc::scoped_refptr<webrtc::KeyProvider> rtc_key_provider() { return impl_; }
+  webrtc::scoped_refptr<webrtc::KeyProvider> rtc_key_provider() { return impl_; }
 
  private:
-  rtc::scoped_refptr<webrtc::DefaultKeyProviderImpl> impl_;
+  webrtc::scoped_refptr<webrtc::DefaultKeyProviderImpl> impl_;
 };
 
 class FrameCryptor {
@@ -127,14 +129,14 @@ class FrameCryptor {
   FrameCryptor(std::shared_ptr<RtcRuntime> rtc_runtime,
                const std::string participant_id,
                webrtc::FrameCryptorTransformer::Algorithm algorithm,
-               rtc::scoped_refptr<webrtc::KeyProvider> key_provider,
-               rtc::scoped_refptr<webrtc::RtpSenderInterface> sender);
+               webrtc::scoped_refptr<webrtc::KeyProvider> key_provider,
+               webrtc::scoped_refptr<webrtc::RtpSenderInterface> sender);
 
   FrameCryptor(std::shared_ptr<RtcRuntime> rtc_runtime,
                const std::string participant_id,
                webrtc::FrameCryptorTransformer::Algorithm algorithm,
-               rtc::scoped_refptr<webrtc::KeyProvider> key_provider,
-               rtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver);
+               webrtc::scoped_refptr<webrtc::KeyProvider> key_provider,
+               webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver);
   ~FrameCryptor();
 
   /// Enable/Disable frame crypto for the sender or receiver.
@@ -157,15 +159,21 @@ class FrameCryptor {
 
   void unregister_observer() const;
 
+  /// Attach a packet trailer transformer for chained processing.
+  void set_packet_trailer_handler(
+      std::shared_ptr<PacketTrailerHandler> handler) const;
+
  private:
   std::shared_ptr<RtcRuntime> rtc_runtime_;
   const rust::String participant_id_;
   mutable webrtc::Mutex mutex_;
-  rtc::scoped_refptr<webrtc::FrameCryptorTransformer> e2ee_transformer_;
-  rtc::scoped_refptr<webrtc::KeyProvider> key_provider_;
-  rtc::scoped_refptr<webrtc::RtpSenderInterface> sender_;
-  rtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver_;
-  mutable rtc::scoped_refptr<NativeFrameCryptorObserver> observer_;
+  webrtc::scoped_refptr<webrtc::FrameCryptorTransformer> e2ee_transformer_;
+  webrtc::scoped_refptr<webrtc::KeyProvider> key_provider_;
+  webrtc::scoped_refptr<webrtc::RtpSenderInterface> sender_;
+  webrtc::scoped_refptr<webrtc::RtpReceiverInterface> receiver_;
+  mutable webrtc::scoped_refptr<NativeFrameCryptorObserver> observer_;
+  mutable webrtc::scoped_refptr<webrtc::FrameTransformerInterface>
+      chained_transformer_;
 };
 
 class NativeFrameCryptorObserver
@@ -181,6 +189,24 @@ class NativeFrameCryptorObserver
  private:
   rust::Box<RtcFrameCryptorObserverWrapper> observer_;
   const FrameCryptor* fc_;
+};
+
+class DataPacketCryptor {
+ public:
+  DataPacketCryptor(webrtc::FrameCryptorTransformer::Algorithm algorithm,
+                   webrtc::scoped_refptr<webrtc::KeyProvider> key_provider);
+
+  EncryptedPacket encrypt_data_packet(
+      const ::rust::String participant_id,
+      uint32_t key_index,
+      rust::Vec<::std::uint8_t> data) const;
+
+  rust::Vec<::std::uint8_t> decrypt_data_packet(
+      const ::rust::String participant_id,
+      const EncryptedPacket& encrypted_packet) const;
+
+ private:
+  webrtc::scoped_refptr<webrtc::DataPacketCryptor> data_packet_cryptor_;
 };
 
 std::shared_ptr<FrameCryptor> new_frame_cryptor_for_rtp_sender(
@@ -199,4 +225,8 @@ std::shared_ptr<FrameCryptor> new_frame_cryptor_for_rtp_receiver(
 
 std::shared_ptr<KeyProvider> new_key_provider(KeyProviderOptions options);
 
-}  // namespace livekit
+std::shared_ptr<DataPacketCryptor> new_data_packet_cryptor(
+    Algorithm algorithm,
+    std::shared_ptr<KeyProvider> key_provider);
+
+}  // namespace livekit_ffi

@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 use std::{
+    collections::HashSet,
     env,
     fs::{self, File},
     io::{self, BufRead, Write},
@@ -27,7 +28,7 @@ use regex::Regex;
 use reqwest::StatusCode;
 
 pub const SCRATH_PATH: &str = "livekit_webrtc";
-pub const WEBRTC_TAG: &str = "webrtc-ed96590";
+pub const WEBRTC_TAG: &str = "webrtc-89d790b";
 pub const IGNORE_DEFINES: [&str; 2] = ["CR_CLANG_REVISION", "CR_XCODE_VERSION"];
 
 pub fn target_os() -> String {
@@ -99,7 +100,7 @@ pub fn prebuilt_dir() -> path::PathBuf {
 
 pub fn download_url() -> String {
     format!(
-        "https://github.com/livekit/client-sdk-rust/releases/download/{}/{}.zip",
+        "https://github.com/livekit/rust-sdks/releases/download/{}/{}.zip",
         WEBRTC_TAG,
         format!("webrtc-{}", webrtc_triple())
     )
@@ -117,20 +118,34 @@ pub fn webrtc_dir() -> path::PathBuf {
 pub fn webrtc_defines() -> Vec<(String, Option<String>)> {
     // read preprocessor definitions from webrtc.ninja
     let defines_re = Regex::new(r"-D(\w+)(?:=([^\s]+))?").unwrap();
-    let webrtc_gni = fs::File::open(webrtc_dir().join("webrtc.ninja")).unwrap();
+    let mut files = vec![webrtc_dir().join("webrtc.ninja")];
+    // include desktop_capture.ninja to avoid ABI mismatch for DesktopCaptureOptions due to WEBRTC_USE_X11 missing
+    // libwebrtc does not implement desktop capture on Android
+    if env::var("CARGO_CFG_TARGET_OS").unwrap() != "android" {
+        files.push(webrtc_dir().join("desktop_capture.ninja"));
+    }
 
-    let mut defines_line = String::default();
-    io::BufReader::new(webrtc_gni).read_line(&mut defines_line).unwrap();
+    let mut seen = HashSet::new();
+    let mut vec = Vec::new();
 
-    let mut vec = Vec::default();
-    for cap in defines_re.captures_iter(&defines_line) {
-        let define_name = &cap[1];
-        let define_value = cap.get(2).map(|m| m.as_str());
-        if IGNORE_DEFINES.contains(&define_name) {
-            continue;
+    for path in files {
+        let gni = fs::File::open(&path)
+            .unwrap_or_else(|e| panic!("Could not open ninja file: {path:?}\n{e:?}"));
+
+        let mut defines_line = String::default();
+        io::BufReader::new(gni).read_line(&mut defines_line).unwrap();
+        for cap in defines_re.captures_iter(&defines_line) {
+            let define_name = &cap[1];
+            let define_value = cap.get(2).map(|m| m.as_str());
+            if IGNORE_DEFINES.contains(&define_name) {
+                continue;
+            }
+            let value = define_value.map(str::to_string);
+            let name = define_name.to_owned();
+            if seen.insert((name.clone(), value.clone())) {
+                vec.push((name, value));
+            }
         }
-
-        vec.push((define_name.to_owned(), define_value.map(str::to_string)));
     }
 
     vec
@@ -154,7 +169,7 @@ pub fn configure_jni_symbols() -> Result<()> {
         .output()
         .expect("failed to run llvm-readelf");
 
-    let jni_regex = Regex::new(r"(Java_org_webrtc.*)").unwrap();
+    let jni_regex = Regex::new(r"(Java_livekit_org_webrtc.*)").unwrap();
     let content = String::from_utf8_lossy(&readelf_output.stdout);
     let jni_symbols: Vec<&str> =
         jni_regex.captures_iter(&content).map(|cap| cap.get(1).unwrap().as_str()).collect();
@@ -194,8 +209,22 @@ pub fn download_webrtc() -> Result<()> {
         return Ok(());
     }
 
-    let mut resp = reqwest::blocking::get(download_url())
-        .context("Failed to send HTTP request to download WebRTC")?;
+    let mut resp = reqwest::blocking::get(download_url());
+    for attempt in 1..3 {
+        let transient = match &resp {
+            Ok(resp) => {
+                resp.status().is_server_error() || resp.status() == StatusCode::TOO_MANY_REQUESTS
+            }
+            Err(_) => true,
+        };
+        if !transient {
+            break;
+        }
+        println!("cargo:warning=webrtc download attempt {} failed, retrying in 5s...", attempt);
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        resp = reqwest::blocking::get(download_url());
+    }
+    let mut resp = resp.context("Failed to send HTTP request to download WebRTC")?;
     if resp.status() != StatusCode::OK {
         return Err(anyhow!("failed to download webrtc: {}", resp.status()));
     }
@@ -210,12 +239,59 @@ pub fn download_webrtc() -> Result<()> {
         .context("Failed to create temporary file for WebRTC download")?;
     resp.copy_to(&mut file).context("Failed to write WebRTC download to temporary file")?;
 
+    // Extract into a sibling temp dir, then atomically rename into place so concurrent
+    // observers see either no `webrtc_dir` or a fully-populated one — never the partially-
+    // extracted state that made `fs::copy(webrtc_dir/LICENSE.md, …)` in callers flaky.
+    let tmp_extract = webrtc_dir.parent().unwrap().join(format!(".{}.tmp", webrtc_triple()));
+    let _ = fs::remove_dir_all(&tmp_extract); // clean up leftover from a crashed build
+    fs::create_dir_all(&tmp_extract).context("Failed to create temp extraction dir")?;
+
     let mut archive = zip::ZipArchive::new(file).context("Failed to open WebRTC zip archive")?;
-    archive.extract(webrtc_dir.parent().unwrap()).context("Failed to extract WebRTC archive")?;
+    archive.extract(&tmp_extract).context("Failed to extract WebRTC archive")?;
     drop(archive);
+
+    // The zip root is `{triple}/`, so extracted content sits at `tmp_extract/{triple}/`.
+    fs::rename(tmp_extract.join(webrtc_triple()), &webrtc_dir)
+        .context("Failed to move extracted WebRTC into place")?;
+    let _ = fs::remove_dir_all(&tmp_extract);
+
+    #[cfg(unix)]
+    ensure_owner_readable(&webrtc_dir).context("Failed to normalize libwebrtc file permissions")?;
 
     fs::remove_file(&tmp_path).context("Failed to remove temporary WebRTC zip file")?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_owner_readable(root: &path::Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fn walk(p: &path::Path) -> Result<()> {
+        let meta = fs::symlink_metadata(p)?;
+        // Don't try to chmod through symlinks — follow them only via the
+        // entries we walk into normally. set_permissions on a symlink may
+        // affect the target on some platforms; just skip.
+        if meta.file_type().is_symlink() {
+            return Ok(());
+        }
+        let mut perms = meta.permissions();
+        let mut mode = perms.mode();
+        mode |= 0o600; // owner read+write
+        if meta.is_dir() {
+            mode |= 0o100; // owner traverse
+        }
+        perms.set_mode(mode);
+        // Best-effort: if the file is on a read-only mount or owned by another
+        // user (shouldn't happen here), we just skip rather than failing the
+        // build over a permission tweak.
+        let _ = fs::set_permissions(p, perms);
+        if meta.is_dir() {
+            for entry in fs::read_dir(p)? {
+                walk(&entry?.path())?;
+            }
+        }
+        Ok(())
+    }
+    walk(root)
 }
 
 pub fn android_ndk_toolchain() -> Result<path::PathBuf> {

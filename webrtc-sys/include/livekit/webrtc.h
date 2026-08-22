@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -25,19 +25,20 @@
 #include "rtc_base/logging.h"
 #include "rtc_base/physical_socket_server.h"
 #include "rtc_base/ssl_adapter.h"
+#include "rtc_base/thread.h"
 #include "rust/cxx.h"
 
 #ifdef WEBRTC_WIN
 #include "rtc_base/win32_socket_init.h"
 #endif
 
-namespace livekit {
+namespace livekit_ffi {
 class RtcRuntime;
 class LogSink;
-}  // namespace livekit
+}  // namespace livekit_ffi
 #include "webrtc-sys/src/webrtc.rs.h"
 
-namespace livekit {
+namespace livekit_ffi {
 
 class MediaStreamTrack;
 class RtpReceiver;
@@ -55,29 +56,29 @@ class RtcRuntime : public std::enable_shared_from_this<RtcRuntime> {
   RtcRuntime& operator=(const RtcRuntime&) = delete;
   ~RtcRuntime();
 
-  rtc::Thread* network_thread() const;
-  rtc::Thread* worker_thread() const;
-  rtc::Thread* signaling_thread() const;
+  webrtc::Thread* network_thread() const;
+  webrtc::Thread* worker_thread() const;
+  webrtc::Thread* signaling_thread() const;
 
   std::shared_ptr<MediaStreamTrack> get_or_create_media_stream_track(
-      rtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track);
+      webrtc::scoped_refptr<webrtc::MediaStreamTrackInterface> track);
 
   std::shared_ptr<AudioTrack> get_or_create_audio_track(
-      rtc::scoped_refptr<webrtc::AudioTrackInterface> track);
+      webrtc::scoped_refptr<webrtc::AudioTrackInterface> track);
 
   std::shared_ptr<VideoTrack> get_or_create_video_track(
-      rtc::scoped_refptr<webrtc::VideoTrackInterface> track);
+      webrtc::scoped_refptr<webrtc::VideoTrackInterface> track);
 
  private:
   RtcRuntime();
 
-  std::unique_ptr<rtc::Thread> network_thread_;
-  std::unique_ptr<rtc::Thread> worker_thread_;
-  std::unique_ptr<rtc::Thread> signaling_thread_;
+  std::unique_ptr<webrtc::Thread> network_thread_;
+  std::unique_ptr<webrtc::Thread> worker_thread_;
+  std::unique_ptr<webrtc::Thread> signaling_thread_;
 
   // Lists used to make sure we don't create multiple wrappers for one
   // underlying webrtc object. (e.g: webrtc::VideoTrackInterface should only
-  // have one livekit::VideoTrack associated with it).
+  // have one livekit_ffi::VideoTrack associated with it).
   // The only reason we to do that is to allow to add states inside our
   // wrappers (e.g: the sinks_ member inside AudioTrack)
   // DataChannel and the PeerConnectionFactory don't need to do this (There's no
@@ -89,19 +90,20 @@ class RtcRuntime : public std::enable_shared_from_this<RtcRuntime> {
   // std::vector<std::weak_ptr<RtpSender>> rtp_senders_;
 
 #ifdef WEBRTC_WIN
-  // rtc::WinsockInitializer winsock_;
-  // rtc::PhysicalSocketServer ss_;
-  // rtc::AutoSocketServerThread main_thread_{&ss_};
+  // webrtc::WinsockInitializer winsock_;
+  // webrtc::PhysicalSocketServer ss_;
+  // webrtc::AutoSocketServerThread main_thread_{&ss_};
 #endif
 };
 
-class LogSink : public rtc::LogSink {
+class LogSink : public webrtc::LogSink {
  public:
   LogSink(rust::Fn<void(rust::String message, LoggingSeverity severity)> fnc);
   ~LogSink();
 
   void OnLogMessage(const std::string& message,
-                    rtc::LoggingSeverity severity) override;
+                    webrtc::LoggingSeverity severity) override;
+
   void OnLogMessage(const std::string& message) override {}
 
  private:
@@ -113,4 +115,6 @@ std::unique_ptr<LogSink> new_log_sink(
 
 rust::String create_random_uuid();
 
-}  // namespace livekit
+rust::Vec<VideoEncoderBackend> video_encoder_backend_list();
+
+}  // namespace livekit_ffi

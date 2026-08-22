@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -25,7 +25,7 @@
 #include "api/video/nv12_buffer.h"
 #include "api/video/video_frame_buffer.h"
 
-namespace livekit {
+namespace livekit_ffi {
 class VideoFrameBuffer;
 class PlanarYuvBuffer;
 class PlanarYuv8Buffer;
@@ -38,27 +38,27 @@ class I422Buffer;
 class I444Buffer;
 class I010Buffer;
 class NV12Buffer;
-}  // namespace livekit
+}  // namespace livekit_ffi
 
 #ifdef __APPLE__
 #include <CoreVideo/CoreVideo.h>
-namespace livekit {
+namespace livekit_ffi {
 typedef __CVBuffer PlatformImageBuffer;
-}  // namespace livekit
+}  // namespace livekit_ffi
 #else
-namespace livekit {
+namespace livekit_ffi {
 typedef void PlatformImageBuffer;
-}  // namespace livekit
+}  // namespace livekit_ffi
 #endif
 
 #include "webrtc-sys/src/video_frame_buffer.rs.h"
 
-namespace livekit {
+namespace livekit_ffi {
 
 class VideoFrameBuffer {
  public:
   explicit VideoFrameBuffer(
-      rtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer);
+      webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer);
 
   VideoFrameBufferType buffer_type() const;
 
@@ -74,15 +74,15 @@ class VideoFrameBuffer {
   std::unique_ptr<I444Buffer> get_i444();
   std::unique_ptr<I010Buffer> get_i010();
   std::unique_ptr<NV12Buffer> get_nv12();
-  rtc::scoped_refptr<webrtc::VideoFrameBuffer> get() const;
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> get() const;
 
  protected:
-  rtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer_;
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer_;
 };
 
 class PlanarYuvBuffer : public VideoFrameBuffer {
  public:
-  explicit PlanarYuvBuffer(rtc::scoped_refptr<webrtc::PlanarYuvBuffer> buffer);
+  explicit PlanarYuvBuffer(webrtc::scoped_refptr<webrtc::PlanarYuvBuffer> buffer);
 
   unsigned int chroma_width() const;
   unsigned int chroma_height() const;
@@ -98,7 +98,7 @@ class PlanarYuvBuffer : public VideoFrameBuffer {
 class PlanarYuv8Buffer : public PlanarYuvBuffer {
  public:
   explicit PlanarYuv8Buffer(
-      rtc::scoped_refptr<webrtc::PlanarYuv8Buffer> buffer);
+      webrtc::scoped_refptr<webrtc::PlanarYuv8Buffer> buffer);
 
   const uint8_t* data_y() const;
   const uint8_t* data_u() const;
@@ -111,7 +111,7 @@ class PlanarYuv8Buffer : public PlanarYuvBuffer {
 class PlanarYuv16BBuffer : public PlanarYuvBuffer {
  public:
   explicit PlanarYuv16BBuffer(
-      rtc::scoped_refptr<webrtc::PlanarYuv16BBuffer> buffer);
+      webrtc::scoped_refptr<webrtc::PlanarYuv16BBuffer> buffer);
 
   const uint16_t* data_y() const;
   const uint16_t* data_u() const;
@@ -124,7 +124,7 @@ class PlanarYuv16BBuffer : public PlanarYuvBuffer {
 class BiplanarYuvBuffer : public VideoFrameBuffer {
  public:
   explicit BiplanarYuvBuffer(
-      rtc::scoped_refptr<webrtc::BiplanarYuvBuffer> buffer);
+      webrtc::scoped_refptr<webrtc::BiplanarYuvBuffer> buffer);
 
   unsigned int chroma_width() const;
   unsigned int chroma_height() const;
@@ -139,7 +139,7 @@ class BiplanarYuvBuffer : public VideoFrameBuffer {
 class BiplanarYuv8Buffer : public BiplanarYuvBuffer {
  public:
   explicit BiplanarYuv8Buffer(
-      rtc::scoped_refptr<webrtc::BiplanarYuv8Buffer> buffer);
+      webrtc::scoped_refptr<webrtc::BiplanarYuv8Buffer> buffer);
 
   const uint8_t* data_y() const;
   const uint8_t* data_uv() const;
@@ -150,15 +150,22 @@ class BiplanarYuv8Buffer : public BiplanarYuvBuffer {
 
 class I420Buffer : public PlanarYuv8Buffer {
  public:
-  explicit I420Buffer(rtc::scoped_refptr<webrtc::I420BufferInterface> buffer);
+  explicit I420Buffer(webrtc::scoped_refptr<webrtc::I420BufferInterface> buffer);
+
+  std::unique_ptr<I420Buffer> scale(int scaled_width, int scaled_height) const;
+
+ private:
+  webrtc::I420BufferInterface* buffer() const;
 };
 
 class I420ABuffer : public I420Buffer {
  public:
-  explicit I420ABuffer(rtc::scoped_refptr<webrtc::I420ABufferInterface> buffer);
+  explicit I420ABuffer(webrtc::scoped_refptr<webrtc::I420ABufferInterface> buffer);
 
   unsigned int stride_a() const;
   const uint8_t* data_a() const;
+
+  std::unique_ptr<I420ABuffer> scale(int scaled_width, int scaled_height) const;
 
  private:
   webrtc::I420ABufferInterface* buffer() const;
@@ -166,27 +173,48 @@ class I420ABuffer : public I420Buffer {
 
 class I422Buffer : public PlanarYuv8Buffer {
  public:
-  explicit I422Buffer(rtc::scoped_refptr<webrtc::I422BufferInterface> buffer);
+  explicit I422Buffer(webrtc::scoped_refptr<webrtc::I422BufferInterface> buffer);
+
+  std::unique_ptr<I422Buffer> scale(int scaled_width, int scaled_height) const;
+
+ private:
+  webrtc::I422BufferInterface* buffer() const;
 };
 
 class I444Buffer : public PlanarYuv8Buffer {
  public:
-  explicit I444Buffer(rtc::scoped_refptr<webrtc::I444BufferInterface> buffer);
+  explicit I444Buffer(webrtc::scoped_refptr<webrtc::I444BufferInterface> buffer);
+
+  std::unique_ptr<I444Buffer> scale(int scaled_width, int scaled_height) const;
+
+ private:
+  webrtc::I444BufferInterface* buffer() const;
 };
 
 class I010Buffer : public PlanarYuv16BBuffer {
  public:
-  explicit I010Buffer(rtc::scoped_refptr<webrtc::I010BufferInterface> buffer);
+  explicit I010Buffer(webrtc::scoped_refptr<webrtc::I010BufferInterface> buffer);
+
+  std::unique_ptr<I010Buffer> scale(int scaled_width, int scaled_height) const;
+
+ private:
+  webrtc::I010BufferInterface* buffer() const;
 };
 
 class NV12Buffer : public BiplanarYuv8Buffer {
  public:
-  explicit NV12Buffer(rtc::scoped_refptr<webrtc::NV12BufferInterface> buffer);
+  explicit NV12Buffer(webrtc::scoped_refptr<webrtc::NV12BufferInterface> buffer);
+
+  std::unique_ptr<NV12Buffer> scale(int scaled_width, int scaled_height) const;
+
+ private:
+  webrtc::NV12BufferInterface* buffer() const;
 };
 
 std::unique_ptr<I420Buffer> copy_i420_buffer(
     const std::unique_ptr<I420Buffer>& i420);
 std::unique_ptr<I420Buffer> new_i420_buffer(int width, int height, int stride_y, int stride_u, int stride_v);
+std::unique_ptr<I420Buffer> new_black_i420_buffer(int width, int height, int stride_y, int stride_u, int stride_v);
 std::unique_ptr<I422Buffer> new_i422_buffer(int width, int height, int stride_y, int stride_u, int stride_v);
 std::unique_ptr<I444Buffer> new_i444_buffer(int width, int height, int stride_y, int stride_u, int stride_v);
 std::unique_ptr<I010Buffer> new_i010_buffer(int width, int height, int stride_y, int stride_u, int stride_v);
@@ -244,4 +272,4 @@ static std::unique_ptr<VideoFrameBuffer> _unique_video_frame_buffer() {
   return nullptr;
 }
 
-}  // namespace livekit
+}  // namespace livekit_ffi

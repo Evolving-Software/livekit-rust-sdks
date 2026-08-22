@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2023 LiveKit, Inc.
+# Copyright 2025 LiveKit, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,7 +12,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 
 # dependencies: cargo install protoc-gen-prost@0.3.1 protoc-gen-prost-serde@0.3.1
 
@@ -32,4 +31,8 @@ protoc \
     $PROTOCOL/livekit_room.proto \
     $PROTOCOL/livekit_webhook.proto \
     $PROTOCOL/livekit_sip.proto \
-    $PROTOCOL/livekit_models.proto
+    $PROTOCOL/livekit_models.proto \
+    $PROTOCOL/livekit_connector.proto \
+    $PROTOCOL/livekit_connector_whatsapp.proto \
+    $PROTOCOL/livekit_connector_twilio.proto \
+    $PROTOCOL/livekit_analytics.proto

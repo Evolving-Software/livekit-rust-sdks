@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,18 +13,28 @@
 // limitations under the License.
 
 use libwebrtc::native::frame_cryptor as fc;
+use std::sync::{
+    atomic::{AtomicI32, Ordering},
+    Arc,
+};
 
 use crate::id::ParticipantIdentity;
+
+pub use libwebrtc::native::frame_cryptor::KeyDerivationAlgorithm;
 
 const DEFAULT_RATCHET_SALT: &str = "LKFrameEncryptionKey";
 const DEFAULT_RATCHET_WINDOW_SIZE: i32 = 16;
 const DEFAULT_FAILURE_TOLERANCE: i32 = -1; // no tolerance by default
+const DEFAULT_KEY_RING_SIZE: i32 = 16;
+const DEFAULT_KEY_DERIVATION_ALGORITHM: KeyDerivationAlgorithm = KeyDerivationAlgorithm::PBKDF2;
 
 #[derive(Clone)]
 pub struct KeyProviderOptions {
     pub ratchet_window_size: i32,
     pub ratchet_salt: Vec<u8>,
     pub failure_tolerance: i32,
+    pub key_ring_size: i32,
+    pub key_derivation_algorithm: KeyDerivationAlgorithm,
 }
 
 impl Default for KeyProviderOptions {
@@ -33,6 +43,8 @@ impl Default for KeyProviderOptions {
             ratchet_window_size: DEFAULT_RATCHET_WINDOW_SIZE,
             ratchet_salt: DEFAULT_RATCHET_SALT.to_owned().into_bytes(),
             failure_tolerance: DEFAULT_FAILURE_TOLERANCE,
+            key_ring_size: DEFAULT_KEY_RING_SIZE,
+            key_derivation_algorithm: DEFAULT_KEY_DERIVATION_ALGORITHM,
         }
     }
 }
@@ -40,6 +52,7 @@ impl Default for KeyProviderOptions {
 #[derive(Clone)]
 pub struct KeyProvider {
     pub(crate) handle: fc::KeyProvider,
+    latest_key_index: Arc<AtomicI32>,
 }
 
 impl KeyProvider {
@@ -51,7 +64,10 @@ impl KeyProvider {
                 ratchet_window_size: options.ratchet_window_size,
                 ratchet_salt: options.ratchet_salt,
                 failure_tolerance: options.failure_tolerance,
+                key_ring_size: options.key_ring_size,
+                key_derivation_algorithm: options.key_derivation_algorithm,
             }),
+            latest_key_index: Arc::new(AtomicI32::new(0)),
         }
     }
 
@@ -61,12 +77,15 @@ impl KeyProvider {
             ratchet_window_size: options.ratchet_window_size,
             ratchet_salt: options.ratchet_salt,
             failure_tolerance: options.failure_tolerance,
+            key_ring_size: options.key_ring_size,
+            key_derivation_algorithm: options.key_derivation_algorithm,
         });
         handle.set_shared_key(0, shared_key);
-        Self { handle }
+        Self { handle, latest_key_index: Arc::new(AtomicI32::new(0)) }
     }
 
     pub fn set_shared_key(&self, shared_key: Vec<u8>, key_index: i32) {
+        self.latest_key_index.store(key_index, Ordering::Relaxed);
         self.handle.set_shared_key(key_index, shared_key);
     }
 
@@ -79,6 +98,7 @@ impl KeyProvider {
     }
 
     pub fn set_key(&self, identity: &ParticipantIdentity, key_index: i32, key: Vec<u8>) -> bool {
+        self.latest_key_index.store(key_index, Ordering::Relaxed);
         self.handle.set_key(identity.to_string(), key_index, key)
     }
 
@@ -92,5 +112,9 @@ impl KeyProvider {
 
     pub fn set_sif_trailer(&self, trailer: Vec<u8>) {
         self.handle.set_sif_trailer(trailer);
+    }
+
+    pub fn get_latest_key_index(&self) -> i32 {
+        self.latest_key_index.load(Ordering::Relaxed)
     }
 }

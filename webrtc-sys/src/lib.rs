@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,15 +15,20 @@
 #[cfg(target_os = "android")]
 pub mod android;
 pub mod apm;
+pub mod audio_device_controller;
+pub mod audio_mixer;
 pub mod audio_resampler;
 pub mod audio_track;
 pub mod candidate;
 pub mod data_channel;
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+pub mod desktop_capturer;
 pub mod frame_cryptor;
 pub mod helper;
 pub mod jsep;
 pub mod media_stream;
 pub mod media_stream_track;
+pub mod packet_trailer;
 pub mod peer_connection;
 pub mod peer_connection_factory;
 pub mod prohibit_libsrtp_initialization;

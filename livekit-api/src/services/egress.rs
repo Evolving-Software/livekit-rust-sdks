@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,10 +14,29 @@
 
 use livekit_protocol as proto;
 
-use http::header::{HeaderMap, HeaderValue, AUTHORIZATION};
-
 use super::{ServiceBase, ServiceResult, LIVEKIT_PACKAGE};
 use crate::{access_token::VideoGrants, get_env_keys, services::twirp_client::TwirpClient};
+
+#[derive(Clone, Copy, Debug, Default)]
+pub enum AudioMixing {
+    /// All users are mixed together.
+    #[default]
+    DefaultMixing,
+    /// Agent audio in the left channel, all other audio in the right channel.
+    DualChannelAgent,
+    /// Each new audio track alternates between left and right channels.
+    DualChannelAlternate,
+}
+
+impl From<AudioMixing> for proto::AudioMixing {
+    fn from(value: AudioMixing) -> Self {
+        match value {
+            AudioMixing::DefaultMixing => proto::AudioMixing::DefaultMixing,
+            AudioMixing::DualChannelAgent => proto::AudioMixing::DualChannelAgent,
+            AudioMixing::DualChannelAlternate => proto::AudioMixing::DualChannelAlternate,
+        }
+    }
+}
 
 #[derive(Default, Clone, Debug)]
 pub struct RoomCompositeOptions {
@@ -26,6 +45,8 @@ pub struct RoomCompositeOptions {
     pub audio_only: bool,
     pub video_only: bool,
     pub custom_base_url: String,
+    /// Only applies when audio_only is true (default: DefaultMixing)
+    pub audio_mixing: AudioMixing,
 }
 
 #[derive(Default, Clone, Debug)]
@@ -63,17 +84,20 @@ pub enum TrackEgressOutput {
     WebSocket(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum EgressListFilter {
+    #[default]
     All,
     Egress(String),
     Room(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EgressListOptions {
     pub filter: EgressListFilter,
     pub active: bool,
+    /// Pagination token, e.g. from a previous response's `next_page_token`.
+    pub page_token: Option<proto::TokenPagination>,
 }
 
 const SVC: &str = "Egress";
@@ -85,35 +109,59 @@ pub struct EgressClient {
 }
 
 impl EgressClient {
+    /// Authenticates with an API key and secret, signing a short-lived token per request.
     pub fn with_api_key(host: &str, api_key: &str, api_secret: &str) -> Self {
-        Self {
-            base: ServiceBase::with_api_key(api_key, api_secret),
-            client: TwirpClient::new(host, LIVEKIT_PACKAGE, None),
-        }
+        Self::build(
+            host,
+            ServiceBase::with_api_key(api_key, api_secret),
+            crate::http_client::Client::new(),
+        )
     }
 
+    /// Authenticates with a pre-signed token, sent verbatim on every request.
+    pub fn with_token(host: &str, token: &str) -> Self {
+        Self::build(host, ServiceBase::with_token(token), crate::http_client::Client::new())
+    }
+
+    /// Builds the client from an already-constructed HTTP client so the unified
+    /// [`LiveKitApi`](super::LiveKitApi) can share one connection pool across services.
+    pub(crate) fn build(host: &str, base: ServiceBase, client: crate::http_client::Client) -> Self {
+        Self { base, client: TwirpClient::with_client(host, LIVEKIT_PACKAGE, None, client) }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_default_headers(mut self, headers: http::HeaderMap) -> Self {
+        self.client = self.client.with_default_headers(headers);
+        self
+    }
+
+    /// Reads the API key and secret from the `LIVEKIT_API_KEY` and
+    /// `LIVEKIT_API_SECRET` environment variables.
     pub fn new(host: &str) -> ServiceResult<Self> {
         let (api_key, api_secret) = get_env_keys()?;
         Ok(Self::with_api_key(host, &api_key, &api_secret))
     }
 
-    // Example modified function
+    /// Enables or disables region failover (enabled by default). Failover only
+    /// engages for LiveKit Cloud hosts.
+    pub fn with_failover(mut self, enabled: bool) -> Self {
+        self.client = self.client.with_failover(enabled);
+        self
+    }
+
+    /// Overrides the default per-request timeout (10s) for calls on this client.
+    pub fn with_request_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.client = self.client.with_request_timeout(timeout);
+        self
+    }
+
     pub async fn start_room_composite_egress(
         &self,
         room: &str,
         outputs: Vec<EgressOutput>,
         options: RoomCompositeOptions,
-        access_token: &str,
     ) -> ServiceResult<proto::EgressInfo> {
         let (file_outputs, stream_outputs, segment_outputs, image_outputs) = get_outputs(outputs);
-
-        // Construct the request headers with Authorization
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", access_token)).unwrap(),
-        );
-
         self.client
             .request(
                 SVC,
@@ -122,6 +170,7 @@ impl EgressClient {
                     room_name: room.to_string(),
                     layout: options.layout,
                     audio_only: options.audio_only,
+                    audio_mixing: Into::<proto::AudioMixing>::into(options.audio_mixing) as i32,
                     video_only: options.video_only,
                     options: Some(proto::room_composite_egress_request::Options::Advanced(
                         options.encoding.into(),
@@ -134,7 +183,8 @@ impl EgressClient {
                     output: None, // Deprecated
                     ..Default::default()
                 },
-                headers, // Inject headers with access_token here
+                self.base
+                    .auth_header(VideoGrants { room_record: true, ..Default::default() }, None)?,
             )
             .await
             .map_err(Into::into)
@@ -267,6 +317,25 @@ impl EgressClient {
             .map_err(Into::into)
     }
 
+    /// Starts an egress using the unified v2 [`StartEgressRequest`](proto::StartEgressRequest),
+    /// which supersedes the per-source `start_*_egress` helpers. Calls the
+    /// `Egress.StartEgress` RPC and returns the created [`EgressInfo`](proto::EgressInfo).
+    pub async fn start_egress(
+        &self,
+        request: proto::StartEgressRequest,
+    ) -> ServiceResult<proto::EgressInfo> {
+        self.client
+            .request(
+                SVC,
+                "StartEgress",
+                request,
+                self.base
+                    .auth_header(VideoGrants { room_record: true, ..Default::default() }, None)?,
+            )
+            .await
+            .map_err(Into::into)
+    }
+
     pub async fn update_layout(
         &self,
         egress_id: &str,
@@ -327,7 +396,12 @@ impl EgressClient {
             .request(
                 SVC,
                 "ListEgress",
-                proto::ListEgressRequest { room_name, egress_id, active: options.active },
+                proto::ListEgressRequest {
+                    room_name,
+                    egress_id,
+                    active: options.active,
+                    page_token: options.page_token,
+                },
                 self.base
                     .auth_header(VideoGrants { room_record: true, ..Default::default() }, None)?,
             )

@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -215,6 +215,26 @@ impl I420Buffer {
         }
     }
 
+    pub fn new_black(
+        width: u32,
+        height: u32,
+        stride_y: u32,
+        stride_u: u32,
+        stride_v: u32,
+    ) -> vf::I420Buffer {
+        vf::I420Buffer {
+            handle: I420Buffer {
+                sys_handle: vfb_sys::ffi::new_black_i420_buffer(
+                    width.try_into().unwrap(),
+                    height.try_into().unwrap(),
+                    stride_y.try_into().unwrap(),
+                    stride_u.try_into().unwrap(),
+                    stride_v.try_into().unwrap(),
+                ),
+            },
+        }
+    }
+
     pub fn sys_handle(&self) -> &vfb_sys::ffi::VideoFrameBuffer {
         unsafe { &*recursive_cast!(&*self.sys_handle, i420_to_yuv8, yuv8_to_yuv, yuv_to_vfb) }
     }
@@ -310,6 +330,14 @@ impl I420Buffer {
                 slice::from_raw_parts((*ptr).data_u(), (self.stride_u() * chroma_height) as usize),
                 slice::from_raw_parts((*ptr).data_v(), (self.stride_v() * chroma_height) as usize),
             )
+        }
+    }
+
+    pub fn scale(&mut self, scaled_width: i32, scaled_height: i32) -> vf::I420Buffer {
+        vf::I420Buffer {
+            handle: I420Buffer {
+                sys_handle: self.sys_handle.pin_mut().scale(scaled_width, scaled_height),
+            },
         }
     }
 }
@@ -408,6 +436,14 @@ impl I420ABuffer {
                     (self.stride_a() * self.height()) as usize,
                 )),
             )
+        }
+    }
+
+    pub fn scale(&mut self, scaled_width: i32, scaled_height: i32) -> vf::I420ABuffer {
+        vf::I420ABuffer {
+            handle: I420ABuffer {
+                sys_handle: self.sys_handle.pin_mut().scale(scaled_width, scaled_height),
+            },
         }
     }
 }
@@ -516,6 +552,14 @@ impl I422Buffer {
             )
         }
     }
+
+    pub fn scale(&mut self, scaled_width: i32, scaled_height: i32) -> vf::I422Buffer {
+        vf::I422Buffer {
+            handle: I422Buffer {
+                sys_handle: self.sys_handle.pin_mut().scale(scaled_width, scaled_height),
+            },
+        }
+    }
 }
 impl I444Buffer {
     pub fn new(
@@ -619,6 +663,14 @@ impl I444Buffer {
                 slice::from_raw_parts((*ptr).data_u(), (self.stride_u() * self.height()) as usize),
                 slice::from_raw_parts((*ptr).data_v(), (self.stride_v() * self.height()) as usize),
             )
+        }
+    }
+
+    pub fn scale(&mut self, scaled_width: i32, scaled_height: i32) -> vf::I444Buffer {
+        vf::I444Buffer {
+            handle: I444Buffer {
+                sys_handle: self.sys_handle.pin_mut().scale(scaled_width, scaled_height),
+            },
         }
     }
 }
@@ -738,6 +790,14 @@ impl I010Buffer {
             )
         }
     }
+
+    pub fn scale(&mut self, scaled_width: i32, scaled_height: i32) -> vf::I010Buffer {
+        vf::I010Buffer {
+            handle: I010Buffer {
+                sys_handle: self.sys_handle.pin_mut().scale(scaled_width, scaled_height),
+            },
+        }
+    }
 }
 
 impl NV12Buffer {
@@ -841,6 +901,14 @@ impl NV12Buffer {
                     (self.stride_uv() * chroma_height) as usize,
                 ),
             )
+        }
+    }
+
+    pub fn scale(&mut self, scaled_width: i32, scaled_height: i32) -> vf::NV12Buffer {
+        vf::NV12Buffer {
+            handle: NV12Buffer {
+                sys_handle: self.sys_handle.pin_mut().scale(scaled_width, scaled_height),
+            },
         }
     }
 }

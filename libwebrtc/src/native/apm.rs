@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -29,14 +29,12 @@ impl AudioProcessingModule {
         noise_suppression_enabled: bool,
     ) -> Self {
         Self {
-            sys_handle: unsafe {
-                sys_apm::create_apm(
-                    echo_canceller_enabled,
-                    gain_controller_enabled,
-                    high_pass_filter_enabled,
-                    noise_suppression_enabled,
-                )
-            },
+            sys_handle: sys_apm::create_apm(
+                echo_canceller_enabled,
+                gain_controller_enabled,
+                high_pass_filter_enabled,
+                noise_suppression_enabled,
+            ),
         }
     }
 
@@ -46,28 +44,32 @@ impl AudioProcessingModule {
         sample_rate: i32,
         num_channels: i32,
     ) -> Result<(), RtcError> {
-        let samples_count = (sample_rate as usize / 100) * num_channels as usize;
-        assert_eq!(data.len(), samples_count, "slice must have 10ms worth of samples");
+        let samples_per_10ms = (sample_rate as usize / 100) * num_channels as usize;
+        assert!(
+            data.len() % samples_per_10ms == 0 && data.len() >= samples_per_10ms,
+            "slice must have a multiple of 10ms worth of samples"
+        );
 
-        if unsafe {
-            // using the same slice for src and dst is safe
-            self.sys_handle.pin_mut().process_stream(
-                data.as_mut_ptr(),
-                data.len(),
-                data.as_mut_ptr(),
-                data.len(),
-                sample_rate,
-                num_channels,
-            )
-        } == 0
-        {
-            Ok(())
-        } else {
-            Err(RtcError {
-                error_type: RtcErrorType::Internal,
-                message: "Failed to process stream".to_string(),
-            })
+        for chunk in data.chunks_mut(samples_per_10ms) {
+            if unsafe {
+                self.sys_handle.pin_mut().process_stream(
+                    chunk.as_mut_ptr(),
+                    chunk.len(),
+                    chunk.as_mut_ptr(),
+                    chunk.len(),
+                    sample_rate,
+                    num_channels,
+                )
+            } != 0
+            {
+                return Err(RtcError {
+                    error_type: RtcErrorType::Internal,
+                    message: "Failed to process stream".to_string(),
+                });
+            }
         }
+
+        Ok(())
     }
 
     pub fn process_reverse_stream(
@@ -76,28 +78,32 @@ impl AudioProcessingModule {
         sample_rate: i32,
         num_channels: i32,
     ) -> Result<(), RtcError> {
-        let samples_count = (sample_rate as usize / 100) * num_channels as usize;
-        assert_eq!(data.len(), samples_count, "slice must have 10ms worth of samples");
+        let samples_per_10ms = (sample_rate as usize / 100) * num_channels as usize;
+        assert!(
+            data.len() % samples_per_10ms == 0 && data.len() >= samples_per_10ms,
+            "slice must have a multiple of 10ms worth of samples"
+        );
 
-        if unsafe {
-            // using the same slice for src and dst is safe
-            self.sys_handle.pin_mut().process_reverse_stream(
-                data.as_mut_ptr(),
-                data.len(),
-                data.as_mut_ptr(),
-                data.len(),
-                sample_rate,
-                num_channels,
-            )
-        } == 0
-        {
-            Ok(())
-        } else {
-            Err(RtcError {
-                error_type: RtcErrorType::Internal,
-                message: "Failed to process reverse stream".to_string(),
-            })
+        for chunk in data.chunks_mut(samples_per_10ms) {
+            if unsafe {
+                self.sys_handle.pin_mut().process_reverse_stream(
+                    chunk.as_mut_ptr(),
+                    chunk.len(),
+                    chunk.as_mut_ptr(),
+                    chunk.len(),
+                    sample_rate,
+                    num_channels,
+                )
+            } != 0
+            {
+                return Err(RtcError {
+                    error_type: RtcErrorType::Internal,
+                    message: "Failed to process reverse stream".to_string(),
+                });
+            }
         }
+
+        Ok(())
     }
 
     pub fn set_stream_delay_ms(&mut self, delay_ms: i32) -> Result<(), RtcError> {

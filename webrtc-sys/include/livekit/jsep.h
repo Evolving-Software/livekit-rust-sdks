@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -27,15 +27,15 @@
 #include "rtc_base/ref_count.h"
 #include "rust/cxx.h"
 
-namespace livekit {
+namespace livekit_ffi {
 class IceCandidate;
 class SessionDescription;
-};  // namespace livekit
+};  // namespace livekit_ffi
 #include "webrtc-sys/src/jsep.rs.h"
 
-namespace livekit {
+namespace livekit_ffi {
 
-class PeerContext;
+struct PeerContext;
 
 class IceCandidate {
  public:
@@ -44,7 +44,7 @@ class IceCandidate {
 
   rust::String sdp_mid() const;
   int sdp_mline_index() const;
-  rust::String candidate() const;  // TODO(theomonnom) Return livekit::Candidate
+  rust::String candidate() const;  // TODO(theomonnom) Return livekit_ffi::Candidate
                                    // instead of rust::String
 
   rust::String stringify() const;
@@ -83,6 +83,10 @@ std::unique_ptr<SessionDescription> create_session_description(
 static std::unique_ptr<SessionDescription> _unique_session_description() {
   return nullptr;  // Ignore
 }
+
+#ifdef LIVEKIT_TEST
+rust::String serialize_sdp_parse_error_for_test();
+#endif
 
 class NativeCreateSdpObserver
     : public webrtc::CreateSessionDescriptionObserver {
@@ -139,7 +143,7 @@ class NativeRtcStatsCollector : public webrtc::RTCStatsCollectorCallback {
       : ctx_(std::move(ctx)), on_stats_(on_stats) {}
 
   void OnStatsDelivered(
-      const rtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
+      const webrtc::scoped_refptr<const webrtc::RTCStatsReport>& report) override {
     on_stats_(std::move(ctx_), report->ToJson());
   }
 
@@ -148,4 +152,4 @@ class NativeRtcStatsCollector : public webrtc::RTCStatsCollectorCallback {
   rust::Fn<void(rust::Box<T>, rust::String)> on_stats_;
 };
 
-}  // namespace livekit
+}  // namespace livekit_ffi

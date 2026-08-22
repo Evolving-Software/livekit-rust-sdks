@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -65,7 +65,9 @@ pub struct RtpTransceiver {
 
 impl RtpTransceiver {
     pub fn mid(&self) -> Option<String> {
-        self.sys_handle.mid().ok()
+        // The C++ shim returns "" when libwebrtc has no mid yet (instead of
+        // calling std::optional::value() which would abort under -fno-exceptions).
+        self.sys_handle.mid().ok().filter(|s| !s.is_empty())
     }
 
     pub fn current_direction(&self) -> Option<RtpTransceiverDirection> {

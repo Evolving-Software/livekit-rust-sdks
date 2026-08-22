@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -24,7 +24,10 @@ use livekit_protocol as proto;
 use livekit_runtime::timeout;
 use parking_lot::Mutex;
 
-use super::{ConnectionQuality, ParticipantInner, ParticipantKind, TrackKind};
+use super::{
+    ClientCapability, ConnectionQuality, ParticipantInner, ParticipantKind, ParticipantKindDetail,
+    ParticipantState, TrackKind,
+};
 use crate::{prelude::*, rtc_engine::RtcEngine, track::TrackError};
 
 const ADD_TRACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -63,6 +66,7 @@ impl Debug for RemoteParticipant {
             .field("sid", &self.sid())
             .field("identity", &self.identity())
             .field("name", &self.name())
+            .field("state", &self.state())
             .finish()
     }
 }
@@ -71,15 +75,35 @@ impl RemoteParticipant {
     pub(crate) fn new(
         rtc_engine: Arc<RtcEngine>,
         kind: ParticipantKind,
+        kind_details: Vec<ParticipantKindDetail>,
         sid: ParticipantSid,
         identity: ParticipantIdentity,
         name: String,
+        state: ParticipantState,
         metadata: String,
         attributes: HashMap<String, String>,
+        joined_at: i64,
         auto_subscribe: bool,
+        permission: Option<proto::ParticipantPermission>,
+        client_protocol: i32,
+        capabilities: Vec<ClientCapability>,
     ) -> Self {
         Self {
-            inner: super::new_inner(rtc_engine, sid, identity, name, metadata, attributes, kind),
+            inner: super::new_inner(
+                rtc_engine,
+                sid,
+                identity,
+                name,
+                state,
+                metadata,
+                attributes,
+                kind,
+                kind_details,
+                joined_at,
+                permission,
+                client_protocol,
+                capabilities,
+            ),
             remote: Arc::new(RemoteInfo { events: Default::default(), auto_subscribe }),
         }
     }
@@ -145,6 +169,7 @@ impl RemoteParticipant {
                 name: remote_publication.name(),
                 r#type: proto::TrackType::from(remote_publication.kind()) as i32,
                 source: proto::TrackSource::from(remote_publication.source()) as i32,
+                muted: remote_publication.is_muted(),
                 ..Default::default()
             });
 
@@ -293,6 +318,20 @@ impl RemoteParticipant {
         super::on_attributes_changed(&self.inner, handler)
     }
 
+    pub(crate) fn on_permission_changed(
+        &self,
+        handler: impl Fn(Participant, Option<proto::ParticipantPermission>) + Send + 'static,
+    ) {
+        super::on_permission_changed(&self.inner, handler)
+    }
+
+    pub(crate) fn on_encryption_status_changed(
+        &self,
+        handler: impl Fn(Participant, bool) + Send + 'static,
+    ) {
+        super::on_encryption_status_changed(&self.inner, handler);
+    }
+
     pub(crate) fn set_speaking(&self, speaking: bool) {
         super::set_speaking(&self.inner, &Participant::Remote(self.clone()), speaking);
     }
@@ -410,6 +449,33 @@ impl RemoteParticipant {
                 });
             }
         });
+
+        publication.on_video_quality_changed({
+            let rtc_engine = self.inner.rtc_engine.clone();
+            move |publication, quality| {
+                let rtc_engine = rtc_engine.clone();
+                livekit_runtime::spawn(async move {
+                    let tsid: String = publication.sid().into();
+                    let quality: i32 = proto::VideoQuality::from(quality).into();
+                    let update_track_settings = proto::UpdateTrackSettings {
+                        track_sids: vec![tsid.clone()],
+                        quality,
+                        ..Default::default()
+                    };
+
+                    log::info!(
+                        "subscriber: sending UpdateTrackSettings to SFU: track={}, quality={:?}",
+                        tsid,
+                        proto::VideoQuality::try_from(quality),
+                    );
+                    rtc_engine
+                        .send_request(proto::signal_request::Message::TrackSetting(
+                            update_track_settings,
+                        ))
+                        .await
+                });
+            }
+        });
     }
 
     pub(crate) fn remove_publication(&self, sid: &TrackSid) -> Option<TrackPublication> {
@@ -448,6 +514,10 @@ impl RemoteParticipant {
 
     pub fn name(&self) -> String {
         self.inner.info.read().name.clone()
+    }
+
+    pub fn state(&self) -> ParticipantState {
+        self.inner.info.read().state
     }
 
     pub fn metadata(&self) -> String {
@@ -489,7 +559,41 @@ impl RemoteParticipant {
         self.inner.info.read().kind
     }
 
+    pub fn kind_details(&self) -> Vec<ParticipantKindDetail> {
+        self.inner.info.read().kind_details.clone()
+    }
+
     pub fn disconnect_reason(&self) -> DisconnectReason {
         self.inner.info.read().disconnect_reason
+    }
+
+    pub fn joined_at(&self) -> i64 {
+        self.inner.info.read().joined_at
+    }
+
+    pub fn permission(&self) -> Option<proto::ParticipantPermission> {
+        self.inner.info.read().permission.clone()
+    }
+
+    pub fn client_protocol(&self) -> i32 {
+        self.inner.info.read().client_protocol
+    }
+
+    /// The capabilities this remote participant's client advertised at join.
+    pub fn capabilities(&self) -> Vec<ClientCapability> {
+        self.inner.info.read().capabilities.clone()
+    }
+
+    pub fn is_encrypted(&self) -> bool {
+        *self.inner.is_encrypted.read()
+    }
+
+    #[doc(hidden)]
+    pub fn update_data_encryption_status(&self, is_encrypted: bool) {
+        super::update_data_encryption_status(
+            &self.inner,
+            &super::Participant::Remote(self.clone()),
+            is_encrypted,
+        );
     }
 }

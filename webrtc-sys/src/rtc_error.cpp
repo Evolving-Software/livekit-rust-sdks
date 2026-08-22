@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -20,7 +20,7 @@
 #include <sstream>
 #include <string>
 
-namespace livekit {
+namespace livekit_ffi {
 
 RtcError to_error(const webrtc::RTCError& error) {
   RtcError lk_error;
@@ -53,16 +53,6 @@ rust::String serialize_deserialize() {
   lk_error.message = "this is not a test, I repeat, this is not a test";
   return serialize_error(lk_error);
 }
-
-void throw_error() {
-  RtcError lk_error;
-  lk_error.error_type = RtcErrorType::InvalidModification;
-  lk_error.error_detail = RtcErrorDetailType::None;
-  lk_error.has_sctp_cause_code = false;
-  lk_error.sctp_cause_code = 0;
-  lk_error.message = "exception is thrown!";
-  throw std::runtime_error(serialize_error(lk_error));
-}
 #endif
 
-}  // namespace livekit
+}  // namespace livekit_ffi

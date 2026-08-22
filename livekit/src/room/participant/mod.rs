@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 
 use std::{collections::HashMap, fmt::Debug, sync::Arc};
 
+use libwebrtc::enum_dispatch;
 use livekit_protocol as proto;
-use livekit_protocol::enum_dispatch;
 use parking_lot::{Mutex, RwLock};
 
 use crate::{prelude::*, rtc_engine::RtcEngine};
@@ -23,7 +23,6 @@ use crate::{prelude::*, rtc_engine::RtcEngine};
 mod local_participant;
 mod remote_participant;
 mod rpc;
-use crate::room::utils;
 
 pub use local_participant::*;
 pub use remote_participant::*;
@@ -38,12 +37,32 @@ pub enum ConnectionQuality {
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ParticipantState {
+    Joining,
+    Joined,
+    Active,
+    Disconnected,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum ParticipantKind {
     Standard,
     Ingress,
     Egress,
     Sip,
     Agent,
+    Connector,
+    Bridge,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum ParticipantKindDetail {
+    CloudAgent,
+    Forwarded,
+    ConnectorWhatsapp,
+    ConnectorTwilio,
+    BridgeRtsp,
+    Simulation,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -64,7 +83,10 @@ pub enum DisconnectReason {
     SipTrunkFailure,
     ConnectionTimeout,
     MediaFailure,
+    AgentError,
 }
+
+pub use livekit_common::ClientCapability;
 
 #[derive(Debug, Clone)]
 pub enum Participant {
@@ -78,13 +100,19 @@ impl Participant {
         pub fn sid(self: &Self) -> ParticipantSid;
         pub fn identity(self: &Self) -> ParticipantIdentity;
         pub fn name(self: &Self) -> String;
+        pub fn state(self: &Self) -> ParticipantState;
         pub fn metadata(self: &Self) -> String;
         pub fn attributes(self: &Self) -> HashMap<String, String>;
         pub fn is_speaking(self: &Self) -> bool;
         pub fn audio_level(self: &Self) -> f32;
         pub fn connection_quality(self: &Self) -> ConnectionQuality;
         pub fn kind(self: &Self) -> ParticipantKind;
+        pub fn kind_details(self: &Self) -> Vec<ParticipantKindDetail>;
         pub fn disconnect_reason(self: &Self) -> DisconnectReason;
+        pub fn joined_at(self: &Self) -> i64;
+        pub fn is_encrypted(self: &Self) -> bool;
+        pub fn permission(self: &Self) -> Option<proto::ParticipantPermission>;
+        pub fn client_protocol(self: &Self) -> i32;
 
         pub(crate) fn update_info(self: &Self, info: proto::ParticipantInfo) -> ();
 
@@ -94,6 +122,7 @@ impl Participant {
         pub(crate) fn set_connection_quality(self: &Self, quality: ConnectionQuality) -> ();
         pub(crate) fn add_publication(self: &Self, publication: TrackPublication) -> ();
         pub(crate) fn remove_publication(self: &Self, sid: &TrackSid) -> Option<TrackPublication>;
+        pub(crate) fn update_data_encryption_status(self: &Self, is_encrypted: bool) -> ();
     );
 
     pub fn track_publications(&self) -> HashMap<TrackSid, TrackPublication> {
@@ -108,13 +137,19 @@ struct ParticipantInfo {
     pub sid: ParticipantSid,
     pub identity: ParticipantIdentity,
     pub name: String,
+    pub state: ParticipantState,
     pub metadata: String,
     pub attributes: HashMap<String, String>,
     pub speaking: bool,
     pub audio_level: f32,
     pub connection_quality: ConnectionQuality,
     pub kind: ParticipantKind,
+    pub kind_details: Vec<ParticipantKindDetail>,
     pub disconnect_reason: DisconnectReason,
+    pub joined_at: i64,
+    pub permission: Option<proto::ParticipantPermission>,
+    pub client_protocol: i32,
+    pub capabilities: Vec<ClientCapability>,
 }
 
 type TrackMutedHandler = Box<dyn Fn(Participant, TrackPublication) + Send>;
@@ -122,6 +157,9 @@ type TrackUnmutedHandler = Box<dyn Fn(Participant, TrackPublication) + Send>;
 type MetadataChangedHandler = Box<dyn Fn(Participant, String, String) + Send>;
 type AttributesChangedHandler = Box<dyn Fn(Participant, HashMap<String, String>) + Send>;
 type NameChangedHandler = Box<dyn Fn(Participant, String, String) + Send>;
+type EncryptionStatusChangedHandler = Box<dyn Fn(Participant, bool) + Send>;
+type PermissionChangedHandler =
+    Box<dyn Fn(Participant, Option<proto::ParticipantPermission>) + Send>;
 
 #[derive(Default)]
 struct ParticipantEvents {
@@ -130,6 +168,8 @@ struct ParticipantEvents {
     metadata_changed: Mutex<Option<MetadataChangedHandler>>,
     attributes_changed: Mutex<Option<AttributesChangedHandler>>,
     name_changed: Mutex<Option<NameChangedHandler>>,
+    encryption_status_changed: Mutex<Option<EncryptionStatusChangedHandler>>,
+    permission_changed: Mutex<Option<PermissionChangedHandler>>,
 }
 
 pub(super) struct ParticipantInner {
@@ -137,6 +177,8 @@ pub(super) struct ParticipantInner {
     info: RwLock<ParticipantInfo>,
     track_publications: RwLock<HashMap<TrackSid, TrackPublication>>,
     events: Arc<ParticipantEvents>,
+    is_encrypted: RwLock<bool>,
+    is_data_encrypted: RwLock<Option<bool>>,
 }
 
 #[derive(Clone)]
@@ -151,9 +193,15 @@ pub(super) fn new_inner(
     sid: ParticipantSid,
     identity: ParticipantIdentity,
     name: String,
+    state: ParticipantState,
     metadata: String,
     attributes: HashMap<String, String>,
     kind: ParticipantKind,
+    kind_details: Vec<ParticipantKindDetail>,
+    joined_at: i64,
+    permission: Option<proto::ParticipantPermission>,
+    client_protocol: i32,
+    capabilities: Vec<ClientCapability>,
 ) -> Arc<ParticipantInner> {
     Arc::new(ParticipantInner {
         rtc_engine,
@@ -161,16 +209,24 @@ pub(super) fn new_inner(
             sid,
             identity,
             name,
+            state,
             metadata,
             attributes,
             kind,
+            kind_details,
             speaking: false,
             audio_level: 0.0,
             connection_quality: ConnectionQuality::Excellent,
             disconnect_reason: DisconnectReason::UnknownReason,
+            joined_at,
+            permission,
+            client_protocol,
+            capabilities,
         }),
         track_publications: Default::default(),
         events: Default::default(),
+        is_encrypted: RwLock::new(false),
+        is_data_encrypted: RwLock::new(None),
     })
 }
 
@@ -180,10 +236,13 @@ pub(super) fn update_info(
     new_info: proto::ParticipantInfo,
 ) {
     let mut info = inner.info.write();
+    info.state = new_info.state().into();
     info.disconnect_reason = new_info.disconnect_reason().into();
     info.kind = new_info.kind().into();
+    info.kind_details = crate::utils::convert_kind_details(&new_info.kind_details);
     info.sid = new_info.sid.try_into().unwrap();
     info.identity = new_info.identity.into();
+    info.joined_at = new_info.joined_at_ms;
 
     let old_name = std::mem::replace(&mut info.name, new_info.name.clone());
     if old_name != new_info.name {
@@ -201,12 +260,23 @@ pub(super) fn update_info(
 
     let old_attributes = std::mem::replace(&mut info.attributes, new_info.attributes.clone());
     let changed_attributes =
-        utils::calculate_changed_attributes(old_attributes, new_info.attributes.clone());
+        crate::utils::calculate_changed_attributes(old_attributes, new_info.attributes.clone());
     if changed_attributes.len() != 0 {
         if let Some(cb) = inner.events.attributes_changed.lock().as_ref() {
             cb(participant.clone(), changed_attributes);
         }
     }
+
+    let old_permission = std::mem::replace(&mut info.permission, new_info.permission.clone());
+    if old_permission != new_info.permission {
+        if let Some(cb) = inner.events.permission_changed.lock().as_ref() {
+            cb(participant.clone(), new_info.permission.clone());
+        }
+    }
+
+    info.client_protocol = new_info.client_protocol;
+    info.capabilities =
+        new_info.capabilities.iter().filter_map(|&c| ClientCapability::try_from(c).ok()).collect();
 }
 
 pub(super) fn set_speaking(
@@ -268,9 +338,87 @@ pub(super) fn on_attributes_changed(
     *inner.events.attributes_changed.lock() = Some(Box::new(handler));
 }
 
+pub(super) fn on_encryption_status_changed(
+    inner: &Arc<ParticipantInner>,
+    handler: impl Fn(Participant, bool) + Send + 'static,
+) {
+    *inner.events.encryption_status_changed.lock() = Some(Box::new(handler));
+}
+
+pub(super) fn on_permission_changed(
+    inner: &Arc<ParticipantInner>,
+    handler: impl Fn(Participant, Option<proto::ParticipantPermission>) + Send + 'static,
+) {
+    *inner.events.permission_changed.lock() = Some(Box::new(handler));
+}
+
+pub(super) fn update_encryption_status(inner: &Arc<ParticipantInner>, participant: &Participant) {
+    use crate::e2ee::EncryptionType;
+
+    let track_publications = inner.track_publications.read();
+    let data_encryption_status = inner.is_data_encrypted.read();
+
+    // Check if all track publications are encrypted
+    let tracks_encrypted = !track_publications.is_empty()
+        && track_publications.values().all(|pub_| pub_.encryption_type() != EncryptionType::None);
+
+    // Overall encryption status: both tracks and data must be encrypted (if data exists)
+    let is_encrypted = match *data_encryption_status {
+        Some(data_encrypted) => tracks_encrypted && data_encrypted,
+        None => tracks_encrypted, // No data messages yet, only consider tracks
+    };
+
+    let mut current_status = inner.is_encrypted.write();
+    if *current_status != is_encrypted {
+        *current_status = is_encrypted;
+        drop(current_status);
+        drop(track_publications);
+        drop(data_encryption_status);
+
+        if let Some(cb) = inner.events.encryption_status_changed.lock().as_ref() {
+            cb(participant.clone(), is_encrypted);
+        }
+    }
+}
+
+pub(super) fn update_data_encryption_status(
+    inner: &Arc<ParticipantInner>,
+    participant: &Participant,
+    is_encrypted: bool,
+) {
+    let mut data_encryption_status = inner.is_data_encrypted.write();
+    let previous_status = *data_encryption_status;
+
+    match previous_status {
+        Some(current) if current == is_encrypted => {
+            // No change needed
+            return;
+        }
+        Some(true) if !is_encrypted => {
+            // Data was encrypted, now unencrypted - update immediately
+            *data_encryption_status = Some(false);
+        }
+        Some(false) if is_encrypted => {
+            // Data was unencrypted, now encrypted - but we need to keep it false
+            // because once we've seen unencrypted data, participant is not fully encrypted
+            return;
+        }
+        None => {
+            // First data message - set the status
+            *data_encryption_status = Some(is_encrypted);
+        }
+        _ => return,
+    }
+
+    drop(data_encryption_status);
+
+    // Update overall encryption status
+    update_encryption_status(inner, participant);
+}
+
 pub(super) fn remove_publication(
     inner: &Arc<ParticipantInner>,
-    _participant: &Participant,
+    participant: &Participant,
     sid: &TrackSid,
 ) -> Option<TrackPublication> {
     let mut tracks = inner.track_publications.write();
@@ -283,6 +431,10 @@ pub(super) fn remove_publication(
         // shouldn't happen (internal)
         log::warn!("could not find publication to remove: {:?}", sid);
     }
+    drop(tracks);
+
+    // Update encryption status after removing publication
+    update_encryption_status(inner, participant);
 
     publication
 }
@@ -346,4 +498,8 @@ pub(super) fn add_publication(
             }
         }
     });
+    drop(tracks);
+
+    // Update encryption status after adding publication
+    update_encryption_status(inner, participant);
 }

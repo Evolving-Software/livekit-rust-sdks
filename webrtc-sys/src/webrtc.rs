@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 use crate::impl_thread_safety;
 
-#[cxx::bridge(namespace = "livekit")]
+#[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
     #[derive(Debug)]
     #[repr(i32)]
@@ -54,12 +54,25 @@ pub mod ffi {
         None,
     }
 
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(i32)]
+    pub enum VideoEncoderBackend {
+        Auto,
+        Software,
+        Hardware,
+        Nvenc,
+        Vaapi,
+        VideoToolbox,
+        PreEncoded,
+    }
+
     unsafe extern "C++" {
         include!("livekit/webrtc.h");
 
         type LogSink;
 
         fn create_random_uuid() -> String;
+        fn video_encoder_backend_list() -> Vec<VideoEncoderBackend>;
         fn new_log_sink(fnc: fn(String, LoggingSeverity)) -> UniquePtr<LogSink>;
     }
 }

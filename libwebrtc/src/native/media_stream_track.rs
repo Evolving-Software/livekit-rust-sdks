@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -44,7 +44,7 @@ pub fn new_media_stream_track(
         })
     } else if sys_handle.kind() == MEDIA_TYPE_VIDEO {
         MediaStreamTrack::Video(video_track::RtcVideoTrack {
-            handle: RtcVideoTrack { sys_handle: unsafe { media_to_video(sys_handle) } },
+            handle: RtcVideoTrack::new(unsafe { media_to_video(sys_handle) }),
         })
     } else {
         panic!("unknown track kind")

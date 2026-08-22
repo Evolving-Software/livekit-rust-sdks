@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ use cxx::UniquePtr;
 
 use crate::{impl_thread_safety, video_frame::ffi::VideoFrame};
 
-#[cxx::bridge(namespace = "livekit")]
+#[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
     #[repr(i32)]
     pub enum ContentHint {
@@ -42,6 +42,45 @@ pub mod ffi {
         pub height: u32,
     }
 
+    #[derive(Debug)]
+    pub struct FrameMetadata {
+        pub has_packet_trailer: bool,
+        pub user_timestamp: u64,
+        pub frame_id: u32,
+        pub user_data: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(i32)]
+    pub enum EncodedVideoCodec {
+        H264,
+        H265,
+        VP8,
+        VP9,
+        AV1,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(i32)]
+    pub enum EncodedFrameType {
+        Key,
+        Delta,
+    }
+
+    #[derive(Debug)]
+    pub struct EncodedVideoFrameData {
+        pub codec: EncodedVideoCodec,
+        pub frame_type: EncodedFrameType,
+        pub timestamp_us: i64,
+    }
+
+    #[derive(Debug)]
+    pub struct EncodedRateControlRequest {
+        pub has_request: bool,
+        pub target_bitrate_bps: u64,
+        pub framerate_fps: f64,
+    }
+
     extern "C++" {
         include!("livekit/video_frame.h");
         include!("livekit/media_stream_track.h");
@@ -50,8 +89,14 @@ pub mod ffi {
         type MediaStreamTrack = crate::media_stream_track::ffi::MediaStreamTrack;
     }
 
-    unsafe extern "C++" {
+    extern "C++" {
+        include!("livekit/packet_trailer.h");
         include!("livekit/video_track.h");
+
+        type PacketTrailerHandler = crate::packet_trailer::ffi::PacketTrailerHandler;
+    }
+
+    unsafe extern "C++" {
 
         type VideoTrack;
         type NativeVideoSink;
@@ -66,8 +111,38 @@ pub mod ffi {
         fn new_native_video_sink(observer: Box<VideoSinkWrapper>) -> SharedPtr<NativeVideoSink>;
 
         fn video_resolution(self: &VideoTrackSource) -> VideoResolution;
-        fn on_captured_frame(self: &VideoTrackSource, frame: &UniquePtr<VideoFrame>) -> bool;
-        fn new_video_track_source(resolution: &VideoResolution) -> SharedPtr<VideoTrackSource>;
+        fn on_captured_frame(
+            self: &VideoTrackSource,
+            frame: &UniquePtr<VideoFrame>,
+            frame_metadata: &FrameMetadata,
+        ) -> bool;
+        fn capture_dmabuf_frame(
+            self: &VideoTrackSource,
+            dmabuf_fd: i32,
+            width: i32,
+            height: i32,
+            pixel_format: i32,
+            timestamp_us: i64,
+            frame_metadata: &FrameMetadata,
+        ) -> bool;
+        fn capture_encoded_frame(
+            self: &VideoTrackSource,
+            width: i32,
+            height: i32,
+            frame: &EncodedVideoFrameData,
+            payload: &[u8],
+            frame_metadata: &FrameMetadata,
+        ) -> bool;
+        fn take_keyframe_request(self: &VideoTrackSource) -> bool;
+        fn take_rate_control_request(self: &VideoTrackSource) -> EncodedRateControlRequest;
+        fn set_packet_trailer_handler(
+            self: &VideoTrackSource,
+            handler: SharedPtr<PacketTrailerHandler>,
+        );
+        fn new_video_track_source(
+            resolution: &VideoResolution,
+            is_screencast: bool,
+        ) -> SharedPtr<VideoTrackSource>;
         fn video_to_media(track: SharedPtr<VideoTrack>) -> SharedPtr<MediaStreamTrack>;
         unsafe fn media_to_video(track: SharedPtr<MediaStreamTrack>) -> SharedPtr<VideoTrack>;
         fn _shared_video_track() -> SharedPtr<VideoTrack>;

@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,13 +19,10 @@ use self::key_provider::KeyProvider;
 pub mod key_provider;
 pub mod manager;
 
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EncryptionType {
-    #[default]
-    None,
-    Gcm,
-    Custom,
-}
+/// Provider implementations for data track.
+pub(crate) mod data_track;
+
+pub use livekit_common::EncryptionType;
 
 #[derive(Clone)]
 pub struct E2eeOptions {

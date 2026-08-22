@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -41,11 +41,42 @@ impl FfiAudioSource {
 
                 let audio_source = NativeAudioSource::new(
                     new_source.options.map(Into::into).unwrap_or_default(),
-                    new_source.sample_rate,
-                    new_source.num_channels,
+                    new_source.sample_rate.unwrap_or(48000),
+                    new_source.num_channels.unwrap_or(1),
                     new_source.queue_size_ms.unwrap_or(1000),
                 );
                 RtcAudioSource::Native(audio_source)
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            proto::AudioSourceType::AudioSourcePlatform => {
+                // Platform ADM-based source - captures from microphone automatically
+                // PlatformAudio must be created first to enable ADM recording
+
+                // If options and platform_audio_handle are provided, configure audio processing
+                if let (Some(ref options), Some(handle)) =
+                    (&new_source.options, new_source.platform_audio_handle)
+                {
+                    if let Ok(ffi_audio) =
+                        server.retrieve_handle::<super::platform_audio::FfiPlatformAudio>(handle)
+                    {
+                        let processing_options = livekit::AudioProcessingOptions {
+                            echo_cancellation: options.echo_cancellation,
+                            noise_suppression: options.noise_suppression,
+                            auto_gain_control: options.auto_gain_control,
+                            prefer_hardware_processing: options.prefer_hardware.unwrap_or(true),
+                        };
+                        if let Err(e) =
+                            ffi_audio.audio.configure_audio_processing(processing_options)
+                        {
+                            log::warn!(
+                                "Failed to configure audio processing for platform source: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+
+                RtcAudioSource::Device
             }
             _ => return Err(FfiError::InvalidRequest("unsupported audio source type".into())),
         };
@@ -75,7 +106,7 @@ impl FfiAudioSource {
         let buffer = capture.buffer;
 
         let source = self.source.clone();
-        let async_id = server.next_id();
+        let async_id = server.resolve_async_id(capture.request_async_id);
 
         let data = unsafe {
             let len = buffer.num_channels * buffer.samples_per_channel;
@@ -83,7 +114,8 @@ impl FfiAudioSource {
         }
         .to_vec();
 
-        let handle = server.async_runtime.spawn(async move {
+        // Use dedicated audio_runtime for audio capture
+        let handle = server.audio_runtime.spawn(async move {
             // The data must be available as long as the client receive the callback.
             match source {
                 #[cfg(not(target_arch = "wasm32"))]
@@ -96,12 +128,19 @@ impl FfiAudioSource {
                     };
 
                     let res = source.capture_frame(&audio_frame).await;
-                    let _ = server.send_event(proto::ffi_event::Message::CaptureAudioFrame(
+                    if let Err(e) = server.send_event(
                         proto::CaptureAudioFrameCallback {
                             async_id,
                             error: res.err().map(|e| e.to_string()),
-                        },
-                    ));
+                        }
+                        .into(),
+                    ) {
+                        log::error!(
+                            "[AUDIO_CAPTURE] Failed to send callback async_id={}: {}",
+                            async_id,
+                            e
+                        );
+                    }
                 }
                 _ => {}
             }

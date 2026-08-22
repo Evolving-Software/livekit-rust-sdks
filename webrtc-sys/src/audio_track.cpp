@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -22,6 +22,7 @@
 #include <memory>
 
 #include "api/audio_options.h"
+#include "api/audio/audio_frame.h"
 #include "api/media_stream_interface.h"
 #include "api/task_queue/task_queue_base.h"
 #include "audio/remix_resample.h"
@@ -31,15 +32,14 @@
 #include "rtc_base/logging.h"
 #include "rtc_base/ref_counted_object.h"
 #include "rtc_base/synchronization/mutex.h"
-#include "rtc_base/time_utils.h"
 #include "rust/cxx.h"
 #include "webrtc-sys/src/audio_track.rs.h"
 
-namespace livekit {
+namespace livekit_ffi {
 
-inline cricket::AudioOptions to_native_audio_options(
+inline webrtc::AudioOptions to_native_audio_options(
     const AudioSourceOptions& options) {
-  cricket::AudioOptions rtc_options{};
+  webrtc::AudioOptions rtc_options{};
   rtc_options.echo_cancellation = options.echo_cancellation;
   rtc_options.noise_suppression = options.noise_suppression;
   rtc_options.auto_gain_control = options.auto_gain_control;
@@ -47,7 +47,7 @@ inline cricket::AudioOptions to_native_audio_options(
 }
 
 inline AudioSourceOptions to_rust_audio_options(
-    const cricket::AudioOptions& rtc_options) {
+    const webrtc::AudioOptions& rtc_options) {
   AudioSourceOptions options{};
   options.echo_cancellation = rtc_options.echo_cancellation.value_or(false);
   options.noise_suppression = rtc_options.noise_suppression.value_or(false);
@@ -56,7 +56,7 @@ inline AudioSourceOptions to_rust_audio_options(
 }
 
 AudioTrack::AudioTrack(std::shared_ptr<RtcRuntime> rtc_runtime,
-                       rtc::scoped_refptr<webrtc::AudioTrackInterface> track)
+                       webrtc::scoped_refptr<webrtc::AudioTrackInterface> track)
     : MediaStreamTrack(rtc_runtime, std::move(track)) {}
 
 AudioTrack::~AudioTrack() {
@@ -87,6 +87,7 @@ NativeAudioSink::NativeAudioSink(rust::Box<AudioSinkWrapper> observer,
       num_channels_(num_channels) {
   frame_.sample_rate_hz_ = sample_rate;
   frame_.num_channels_ = num_channels;
+  frame_.samples_per_channel_ = webrtc::SampleRateToDefaultChannelSize(sample_rate);
 }
 
 void NativeAudioSink::OnData(const void* audio_data,
@@ -99,9 +100,11 @@ void NativeAudioSink::OnData(const void* audio_data,
   const int16_t* data = static_cast<const int16_t*>(audio_data);
 
   if (sample_rate_ != sample_rate || num_channels_ != number_of_channels) {
+    webrtc::InterleavedView<const int16_t> source(data,
+                                         number_of_frames,
+                                         number_of_channels);
     // resample/remix before capturing
-    webrtc::voe::RemixAndResample(data, number_of_frames, number_of_channels,
-                                  sample_rate, &resampler_, &frame_);
+    webrtc::voe::RemixAndResample(source, sample_rate, &resampler_, &frame_);
 
     rust::Slice<const int16_t> rust_slice(
         frame_.data(), frame_.num_channels() * frame_.samples_per_channel());
@@ -127,26 +130,25 @@ std::shared_ptr<NativeAudioSink> new_native_audio_sink(
 }
 
 AudioTrackSource::InternalSource::InternalSource(
-    const cricket::AudioOptions& options,
+    const webrtc::AudioOptions& options,
     int sample_rate,
     int num_channels,
     int queue_size_ms,  // must be a multiple of 10ms
     webrtc::TaskQueueFactory* task_queue_factory)
-    : sample_rate_(sample_rate),
+    : options_(options),
+      sample_rate_(sample_rate),
       num_channels_(num_channels),
       capture_userdata_(nullptr),
       on_complete_(nullptr) {
-  if (!queue_size_ms)
+  if (!queue_size_ms) {
+    // Set queue_size_samples_ to 0 so that capture_frame() will get to the fast path.
+    queue_size_samples_ = 0;
     return;  // no audio queue
-
-  // start sending silence when there is nothing on the queue for 10 frames
-  // (100ms)
-  const int silence_frames_threshold = 10;
-  missed_frames_ = silence_frames_threshold;
+  }
 
   int samples10ms = sample_rate / 100 * num_channels;
 
-  silence_buffer_ = new int16_t[samples10ms]();
+  silence_buffer_.assign(samples10ms, 0);
   queue_size_samples_ = queue_size_ms / 10 * samples10ms;
   notify_threshold_samples_ = queue_size_samples_;  // TODO: this is currently
                                                     // using x2 the queue size
@@ -160,20 +162,19 @@ AudioTrackSource::InternalSource::InternalSource(
       audio_queue_.get(),
       [this, samples10ms]() {
         webrtc::MutexLock lock(&mutex_);
+        constexpr int kBitsPerSample = sizeof(int16_t) * 8;
 
         if (buffer_.size() >= samples10ms) {
           for (auto sink : sinks_)
-            sink->OnData(buffer_.data(), sizeof(int16_t) * 8, sample_rate_,
+            sink->OnData(buffer_.data(), kBitsPerSample, sample_rate_,
                          num_channels_, samples10ms / num_channels_);
 
           buffer_.erase(buffer_.begin(), buffer_.begin() + samples10ms);
         } else {
-          missed_frames_++;
-          if (missed_frames_ >= silence_frames_threshold) {
-            for (auto sink : sinks_)
-              sink->OnData(silence_buffer_, sizeof(int16_t) * 8, sample_rate_,
-                           num_channels_, samples10ms / num_channels_);
-          }
+          // Always provide a 10ms frame to avoid playout underruns.
+          for (auto sink : sinks_)
+            sink->OnData(silence_buffer_.data(), kBitsPerSample, sample_rate_,
+                         num_channels_, samples10ms / num_channels_);
         }
 
         if (on_complete_ && buffer_.size() <= notify_threshold_samples_) {
@@ -188,7 +189,6 @@ AudioTrackSource::InternalSource::InternalSource(
 }
 
 AudioTrackSource::InternalSource::~InternalSource() {
-  delete[] silence_buffer_;
 }
 
 bool AudioTrackSource::InternalSource::capture_frame(
@@ -219,7 +219,7 @@ bool AudioTrackSource::InternalSource::capture_frame(
     }
 
   } else {
-    // capture directly when the queue buffer is 0 (frame size must be 10ms)
+    // Fast path: capture directly when the queue buffer is 0 (frame size must be 10ms)
     for (auto sink : sinks_)
       sink->OnData(data.data(), sizeof(int16_t) * 8, sample_rate,
                    number_of_channels, number_of_frames);
@@ -242,13 +242,13 @@ bool AudioTrackSource::InternalSource::remote() const {
   return false;
 }
 
-const cricket::AudioOptions AudioTrackSource::InternalSource::options() const {
+const webrtc::AudioOptions AudioTrackSource::InternalSource::options() const {
   webrtc::MutexLock lock(&mutex_);
   return options_;
 }
 
 void AudioTrackSource::InternalSource::set_options(
-    const cricket::AudioOptions& options) {
+    const webrtc::AudioOptions& options) {
   webrtc::MutexLock lock(&mutex_);
   options_ = options;
 }
@@ -270,7 +270,7 @@ AudioTrackSource::AudioTrackSource(AudioSourceOptions options,
                                    int num_channels,
                                    int queue_size_ms,
                                    webrtc::TaskQueueFactory* task_queue_factory)
-    : source_(rtc::make_ref_counted<InternalSource>(
+    : source_(webrtc::make_ref_counted<InternalSource>(
           to_native_audio_options(options),
           sample_rate,
           num_channels,
@@ -311,9 +311,9 @@ std::shared_ptr<AudioTrackSource> new_audio_track_source(
                                             GetGlobalTaskQueueFactory());
 }
 
-rtc::scoped_refptr<AudioTrackSource::InternalSource> AudioTrackSource::get()
+webrtc::scoped_refptr<AudioTrackSource::InternalSource> AudioTrackSource::get()
     const {
   return source_;
 }
 
-}  // namespace livekit
+}  // namespace livekit_ffi

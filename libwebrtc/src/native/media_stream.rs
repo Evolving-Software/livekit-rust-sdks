@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ impl MediaStream {
         self.sys_handle
             .get_video_tracks()
             .into_iter()
-            .map(|t| video_track::RtcVideoTrack { handle: RtcVideoTrack { sys_handle: t.ptr } })
+            .map(|t| video_track::RtcVideoTrack { handle: RtcVideoTrack::new(t.ptr) })
             .collect()
     }
 }

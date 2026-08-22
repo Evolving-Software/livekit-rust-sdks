@@ -28,7 +28,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
 async fn run_sender(room: Room) -> Result<(), Box<dyn Error>> {
     println!("Running as sender");
     loop {
-        let options = StreamTextOptions { topic: TOPIC.to_string(), ..Default::default() };
+        let options = StreamTextOptions::new_with_topic(TOPIC);
         let writer = room.local_participant().stream_text(options).await?;
         println!("Opened new stream");
 
@@ -52,7 +52,9 @@ async fn run_receiver(
         log::info!("Event: {:?}", msg);
         match msg {
             RoomEvent::TextStreamOpened { reader, topic, participant_identity } => {
-                if topic != TOPIC { continue };
+                if topic != TOPIC {
+                    continue;
+                };
                 let Some(mut reader) = reader.take() else { continue };
                 while let Some(chunk) = reader.try_next().await? {
                     println!("Chunk received from {}: '{}'", participant_identity, chunk);

@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,9 @@
 
 use std::sync::Arc;
 
+use libwebrtc::enum_dispatch;
 use libwebrtc::{prelude::*, stats::RtcStats};
 use livekit_protocol as proto;
-use livekit_protocol::enum_dispatch;
 
 use super::{track_dispatch, TrackInner};
 use crate::prelude::*;

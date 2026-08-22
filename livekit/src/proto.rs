@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,9 +14,7 @@
 
 use livekit_protocol::*;
 
-use crate::{
-    e2ee::EncryptionType, participant, room::ChatMessage as RoomChatMessage, track, DataPacketKind,
-};
+use crate::{participant, room::ChatMessage as RoomChatMessage, track, DataPacketKind};
 
 // Conversions
 impl From<ConnectionQuality> for participant::ConnectionQuality {
@@ -49,6 +47,31 @@ impl From<DisconnectReason> for participant::DisconnectReason {
             DisconnectReason::SipTrunkFailure => Self::SipTrunkFailure,
             DisconnectReason::ConnectionTimeout => Self::ConnectionTimeout,
             DisconnectReason::MediaFailure => Self::MediaFailure,
+            DisconnectReason::AgentError => Self::AgentError,
+        }
+    }
+}
+
+impl From<participant::DisconnectReason> for DisconnectReason {
+    fn from(value: participant::DisconnectReason) -> Self {
+        match value {
+            participant::DisconnectReason::UnknownReason => Self::UnknownReason,
+            participant::DisconnectReason::ClientInitiated => Self::ClientInitiated,
+            participant::DisconnectReason::DuplicateIdentity => Self::DuplicateIdentity,
+            participant::DisconnectReason::ServerShutdown => Self::ServerShutdown,
+            participant::DisconnectReason::ParticipantRemoved => Self::ParticipantRemoved,
+            participant::DisconnectReason::RoomDeleted => Self::RoomDeleted,
+            participant::DisconnectReason::StateMismatch => Self::StateMismatch,
+            participant::DisconnectReason::JoinFailure => Self::JoinFailure,
+            participant::DisconnectReason::Migration => Self::Migration,
+            participant::DisconnectReason::SignalClose => Self::SignalClose,
+            participant::DisconnectReason::RoomClosed => Self::RoomClosed,
+            participant::DisconnectReason::UserUnavailable => Self::UserUnavailable,
+            participant::DisconnectReason::UserRejected => Self::UserRejected,
+            participant::DisconnectReason::SipTrunkFailure => Self::SipTrunkFailure,
+            participant::DisconnectReason::ConnectionTimeout => Self::ConnectionTimeout,
+            participant::DisconnectReason::MediaFailure => Self::MediaFailure,
+            participant::DisconnectReason::AgentError => Self::AgentError,
         }
     }
 }
@@ -116,22 +139,13 @@ impl From<data_packet::Kind> for DataPacketKind {
     }
 }
 
-impl From<encryption::Type> for EncryptionType {
-    fn from(value: livekit_protocol::encryption::Type) -> Self {
+impl From<participant_info::State> for participant::ParticipantState {
+    fn from(value: participant_info::State) -> Self {
         match value {
-            livekit_protocol::encryption::Type::None => Self::None,
-            livekit_protocol::encryption::Type::Gcm => Self::Gcm,
-            livekit_protocol::encryption::Type::Custom => Self::Custom,
-        }
-    }
-}
-
-impl From<EncryptionType> for encryption::Type {
-    fn from(value: EncryptionType) -> Self {
-        match value {
-            EncryptionType::None => Self::None,
-            EncryptionType::Gcm => Self::Gcm,
-            EncryptionType::Custom => Self::Custom,
+            participant_info::State::Joining => participant::ParticipantState::Joining,
+            participant_info::State::Joined => participant::ParticipantState::Joined,
+            participant_info::State::Active => participant::ParticipantState::Active,
+            participant_info::State::Disconnected => participant::ParticipantState::Disconnected,
         }
     }
 }
@@ -144,6 +158,33 @@ impl From<participant_info::Kind> for participant::ParticipantKind {
             participant_info::Kind::Egress => participant::ParticipantKind::Egress,
             participant_info::Kind::Sip => participant::ParticipantKind::Sip,
             participant_info::Kind::Agent => participant::ParticipantKind::Agent,
+            participant_info::Kind::Connector => participant::ParticipantKind::Connector,
+            participant_info::Kind::Bridge => participant::ParticipantKind::Bridge,
+        }
+    }
+}
+
+impl From<participant_info::KindDetail> for participant::ParticipantKindDetail {
+    fn from(value: participant_info::KindDetail) -> Self {
+        match value {
+            participant_info::KindDetail::CloudAgent => {
+                participant::ParticipantKindDetail::CloudAgent
+            }
+            participant_info::KindDetail::Forwarded => {
+                participant::ParticipantKindDetail::Forwarded
+            }
+            participant_info::KindDetail::ConnectorWhatsapp => {
+                participant::ParticipantKindDetail::ConnectorWhatsapp
+            }
+            participant_info::KindDetail::ConnectorTwilio => {
+                participant::ParticipantKindDetail::ConnectorTwilio
+            }
+            participant_info::KindDetail::BridgeRtsp => {
+                participant::ParticipantKindDetail::BridgeRtsp
+            }
+            participant_info::KindDetail::Simulation => {
+                participant::ParticipantKindDetail::Simulation
+            }
         }
     }
 }

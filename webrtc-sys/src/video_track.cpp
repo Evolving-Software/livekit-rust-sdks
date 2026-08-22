@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -17,6 +17,7 @@
 #include "livekit/video_track.h"
 
 #include <algorithm>
+#include <chrono>
 #include <iostream>
 #include <memory>
 
@@ -25,18 +26,49 @@
 #include "api/video/video_rotation.h"
 #include "audio/remix_resample.h"
 #include "common_audio/include/audio_util.h"
+#include "livekit/dmabuf_video_frame_buffer.h"
+#include "livekit/encoded_video_frame_buffer.h"
 #include "livekit/media_stream.h"
+#include "livekit/packet_trailer.h"
 #include "livekit/video_track.h"
 #include "rtc_base/logging.h"
 #include "rtc_base/ref_counted_object.h"
 #include "rtc_base/synchronization/mutex.h"
 #include "rtc_base/time_utils.h"
+#include "webrtc-sys/src/packet_trailer.rs.h"
 #include "webrtc-sys/src/video_track.rs.h"
 
-namespace livekit {
+namespace livekit_ffi {
+namespace {
+
+livekit::EncodedVideoCodec ToNativeEncodedCodec(EncodedVideoCodec codec) {
+  switch (codec) {
+    case EncodedVideoCodec::H264:
+      return livekit::EncodedVideoCodec::kH264;
+    case EncodedVideoCodec::H265:
+      return livekit::EncodedVideoCodec::kH265;
+    case EncodedVideoCodec::VP8:
+      return livekit::EncodedVideoCodec::kVP8;
+    case EncodedVideoCodec::VP9:
+      return livekit::EncodedVideoCodec::kVP9;
+    case EncodedVideoCodec::AV1:
+      return livekit::EncodedVideoCodec::kAV1;
+  }
+}
+
+livekit::EncodedFrameType ToNativeEncodedFrameType(EncodedFrameType frame_type) {
+  switch (frame_type) {
+    case EncodedFrameType::Key:
+      return livekit::EncodedFrameType::kKey;
+    case EncodedFrameType::Delta:
+      return livekit::EncodedFrameType::kDelta;
+  }
+}
+
+}  // namespace
 
 VideoTrack::VideoTrack(std::shared_ptr<RtcRuntime> rtc_runtime,
-                       rtc::scoped_refptr<webrtc::VideoTrackInterface> track)
+                       webrtc::scoped_refptr<webrtc::VideoTrackInterface> track)
     : MediaStreamTrack(rtc_runtime, std::move(track)) {}
 
 VideoTrack::~VideoTrack() {
@@ -49,7 +81,7 @@ VideoTrack::~VideoTrack() {
 void VideoTrack::add_sink(const std::shared_ptr<NativeVideoSink>& sink) const {
   webrtc::MutexLock lock(&mutex_);
   track()->AddOrUpdateSink(sink.get(),
-                           rtc::VideoSinkWants());  // TODO(theomonnom): Expose
+                           webrtc::VideoSinkWants());  // TODO(theomonnom): Expose
                                                     // VideoSinkWants to Rust?
   sinks_.push_back(sink);
 }
@@ -105,16 +137,16 @@ std::shared_ptr<NativeVideoSink> new_native_video_sink(
 }
 
 VideoTrackSource::InternalSource::InternalSource(
-    const VideoResolution& resolution)
-    : rtc::AdaptedVideoTrackSource(4), resolution_(resolution) {}
+    const VideoResolution& resolution, bool is_screencast)
+    : webrtc::AdaptedVideoTrackSource(4), resolution_(resolution), is_screencast_(is_screencast) {}
 
 VideoTrackSource::InternalSource::~InternalSource() {}
 
 bool VideoTrackSource::InternalSource::is_screencast() const {
-  return false;
+  return is_screencast_;
 }
 
-absl::optional<bool> VideoTrackSource::InternalSource::needs_denoising() const {
+std::optional<bool> VideoTrackSource::InternalSource::needs_denoising() const {
   return false;
 }
 
@@ -133,18 +165,50 @@ VideoResolution VideoTrackSource::InternalSource::video_resolution() const {
 }
 
 bool VideoTrackSource::InternalSource::on_captured_frame(
-    const webrtc::VideoFrame& frame) {
+    const webrtc::VideoFrame& frame,
+    const FrameMetadata& frame_metadata) {
   webrtc::MutexLock lock(&mutex_);
 
   int64_t aligned_timestamp_us = timestamp_aligner_.TranslateTimestamp(
-      frame.timestamp_us(), rtc::TimeMicros());
+      frame.timestamp_us(), webrtc::TimeMicros());
 
-  rtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer =
+  // If a packet trailer was provided on this frame and we have a handler,
+  // store the mapping keyed by the aligned timestamp.  This is the value
+  // that CaptureTime() will return in TransformSend, so the lookup will
+  // succeed.
+  if (frame_metadata.has_packet_trailer && packet_trailer_handler_) {
+    packet_trailer_handler_->store_frame_metadata(
+        aligned_timestamp_us, frame_metadata.user_timestamp,
+        frame_metadata.frame_id,
+        rust::Slice<const uint8_t>(frame_metadata.user_data.data(),
+                                   frame_metadata.user_data.size()));
+  }
+
+  webrtc::scoped_refptr<webrtc::VideoFrameBuffer> buffer =
       frame.video_frame_buffer();
 
   if (resolution_.height == 0 || resolution_.width == 0) {
     resolution_ = VideoResolution{static_cast<uint32_t>(buffer->width()),
                                   static_cast<uint32_t>(buffer->height())};
+  }
+
+  // Pre-encoded access units bypass the adapter entirely: frame-rate and
+  // resolution adaptation operate on raw frames, and dropping or scaling an
+  // encoded delta frame would corrupt the bitstream for every receiver.
+  if (livekit::EncodedVideoFrameBuffer::FromNative(buffer.get())) {
+    if (packet_trailer_handler_) {
+      packet_trailer_handler_->emit_publish_timing(
+          VideoPublishTimingStage::EncoderUpload,
+          frame_metadata.has_packet_trailer ? frame_metadata.user_timestamp
+                                            : 0,
+          frame_metadata.has_packet_trailer ? frame_metadata.frame_id : 0);
+    }
+    OnFrame(webrtc::VideoFrame::Builder()
+                .set_video_frame_buffer(buffer)
+                .set_rotation(frame.rotation())
+                .set_timestamp_us(aligned_timestamp_us)
+                .build());
+    return true;
   }
 
   int adapted_width, adapted_height, crop_width, crop_height, crop_x, crop_y;
@@ -161,9 +225,16 @@ bool VideoTrackSource::InternalSource::on_captured_frame(
 
   webrtc::VideoRotation rotation = frame.rotation();
   if (apply_rotation() && rotation != webrtc::kVideoRotation_0) {
-    // If the buffer is I420, rtc::AdaptedVideoTrackSource will handle the
+    // If the buffer is I420, webrtc::AdaptedVideoTrackSource will handle the
     // rotation for us.
     buffer = buffer->ToI420();
+  }
+
+  if (packet_trailer_handler_) {
+    packet_trailer_handler_->emit_publish_timing(
+        VideoPublishTimingStage::EncoderUpload,
+        frame_metadata.has_packet_trailer ? frame_metadata.user_timestamp : 0,
+        frame_metadata.has_packet_trailer ? frame_metadata.frame_id : 0);
   }
 
   OnFrame(webrtc::VideoFrame::Builder()
@@ -175,8 +246,14 @@ bool VideoTrackSource::InternalSource::on_captured_frame(
   return true;
 }
 
-VideoTrackSource::VideoTrackSource(const VideoResolution& resolution) {
-  source_ = rtc::make_ref_counted<InternalSource>(resolution);
+void VideoTrackSource::InternalSource::set_packet_trailer_handler(
+    std::shared_ptr<PacketTrailerHandler> handler) {
+  webrtc::MutexLock lock(&mutex_);
+  packet_trailer_handler_ = std::move(handler);
+}
+
+VideoTrackSource::VideoTrackSource(const VideoResolution& resolution, bool is_screencast) {
+  source_ = webrtc::make_ref_counted<InternalSource>(resolution, is_screencast);
 }
 
 VideoResolution VideoTrackSource::video_resolution() const {
@@ -184,19 +261,87 @@ VideoResolution VideoTrackSource::video_resolution() const {
 }
 
 bool VideoTrackSource::on_captured_frame(
-    const std::unique_ptr<VideoFrame>& frame) const {
+    const std::unique_ptr<VideoFrame>& frame,
+    const FrameMetadata& frame_metadata) const {
   auto rtc_frame = frame->get();
-  return source_->on_captured_frame(rtc_frame);
+  return source_->on_captured_frame(rtc_frame, frame_metadata);
 }
 
-rtc::scoped_refptr<VideoTrackSource::InternalSource> VideoTrackSource::get()
+bool VideoTrackSource::capture_dmabuf_frame(int dmabuf_fd,
+                                            int width,
+                                            int height,
+                                            int pixel_format,
+                                            int64_t timestamp_us,
+                                            const FrameMetadata& frame_metadata) const {
+  auto dmabuf_pixel_format =
+      static_cast<livekit::DmaBufPixelFormat>(pixel_format);
+  auto buffer = webrtc::make_ref_counted<livekit::DmaBufVideoFrameBuffer>(
+      dmabuf_fd, width, height, dmabuf_pixel_format);
+
+  int64_t ts = timestamp_us;
+  if (ts == 0) {
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    ts = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
+  }
+
+  auto frame = webrtc::VideoFrame::Builder()
+                   .set_video_frame_buffer(std::move(buffer))
+                   .set_rotation(webrtc::kVideoRotation_0)
+                   .set_timestamp_us(ts)
+                   .build();
+
+  return source_->on_captured_frame(frame, frame_metadata);
+}
+
+bool VideoTrackSource::capture_encoded_frame(
+    int width,
+    int height,
+    const EncodedVideoFrameData& encoded_frame,
+    rust::Slice<const uint8_t> payload,
+    const FrameMetadata& frame_metadata) const {
+  // The single unavoidable copy on this path: the Rust payload only lives
+  // for the duration of this call, while the EncodedImageBuffer is shared
+  // (uncopied) with the pass-through encoder downstream.
+  auto buffer = webrtc::make_ref_counted<livekit::EncodedVideoFrameBuffer>(
+      width, height, ToNativeEncodedCodec(encoded_frame.codec),
+      ToNativeEncodedFrameType(encoded_frame.frame_type),
+      webrtc::EncodedImageBuffer::Create(payload.data(), payload.size()),
+      source_->keyframe_request_flag(), source_->rate_control_state());
+
+  auto frame = webrtc::VideoFrame::Builder()
+                   .set_video_frame_buffer(std::move(buffer))
+                   .set_rotation(webrtc::kVideoRotation_0)
+                   .set_timestamp_us(encoded_frame.timestamp_us)
+                   .build();
+
+  return source_->on_captured_frame(frame, frame_metadata);
+}
+
+bool VideoTrackSource::take_keyframe_request() const {
+  return source_->keyframe_request_flag()->exchange(false,
+                                                    std::memory_order_relaxed);
+}
+
+EncodedRateControlRequest VideoTrackSource::take_rate_control_request() const {
+  auto request = source_->rate_control_state()->Take();
+  return EncodedRateControlRequest{request.has_request,
+                                   request.target_bitrate_bps,
+                                   request.framerate_fps};
+}
+
+void VideoTrackSource::set_packet_trailer_handler(
+    std::shared_ptr<PacketTrailerHandler> handler) const {
+  source_->set_packet_trailer_handler(std::move(handler));
+}
+
+webrtc::scoped_refptr<VideoTrackSource::InternalSource> VideoTrackSource::get()
     const {
   return source_;
 }
 
 std::shared_ptr<VideoTrackSource> new_video_track_source(
-    const VideoResolution& resolution) {
-  return std::make_shared<VideoTrackSource>(resolution);
+    const VideoResolution& resolution, bool is_screencast) {
+  return std::make_shared<VideoTrackSource>(resolution, is_screencast);
 }
 
-}  // namespace livekit
+}  // namespace livekit_ffi

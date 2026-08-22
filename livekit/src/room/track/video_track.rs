@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use libwebrtc::enum_dispatch;
 use libwebrtc::prelude::*;
 use livekit_protocol as proto;
-use livekit_protocol::enum_dispatch;
 
 use super::track_dispatch;
 use crate::prelude::*;

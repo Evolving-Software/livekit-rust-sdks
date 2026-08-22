@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -16,7 +16,7 @@
 
 #include "livekit/rtp_parameters.h"
 
-namespace livekit {
+namespace livekit_ffi {
 
 webrtc::RtcpFeedback to_native_rtcp_feedback(RtcpFeedback feedback) {
   webrtc::RtcpFeedback native{};
@@ -34,7 +34,7 @@ webrtc::RtpCodecCapability to_native_rtp_codec_capability(
   // native.mime_type(); IGNORED
 
   native.name = capability.name.c_str();
-  native.kind = static_cast<cricket::MediaType>(capability.kind);
+  native.kind = static_cast<webrtc::MediaType>(capability.kind);
 
   if (capability.has_clock_rate)
     native.clock_rate = capability.clock_rate;
@@ -133,7 +133,7 @@ webrtc::RtpCodecParameters to_native_rtp_codec_parameters(
     RtpCodecParameters params) {
   webrtc::RtpCodecParameters native{};
   native.name = params.name.c_str();
-  native.kind = static_cast<cricket::MediaType>(params.kind);
+  native.kind = static_cast<webrtc::MediaType>(params.kind);
   native.payload_type = params.payload_type;
 
   for (auto pair : params.parameters)
@@ -411,4 +411,4 @@ RtpParameters to_rust_rtp_parameters(webrtc::RtpParameters params) {
   return rust;
 }
 
-}  // namespace livekit
+}  // namespace livekit_ffi

@@ -1,5 +1,5 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,24 +20,24 @@
 
 #include "api/candidate.h"
 
-namespace livekit {
+namespace livekit_ffi {
 class Candidate;
 }
 #include "webrtc-sys/src/candidate.rs.h"
 
-// cricket::Candidate
-namespace livekit {
+// webrtc::Candidate
+namespace livekit_ffi {
 
 class Candidate {
  public:
-  explicit Candidate(const cricket::Candidate& candidate);
+  explicit Candidate(const webrtc::Candidate& candidate);
 
  private:
-  cricket::Candidate candidate_;
+  webrtc::Candidate candidate_;
 };
 
 static std::shared_ptr<Candidate> _shared_candidate() {
   return nullptr;
 }
 
-}  // namespace livekit
+}  // namespace livekit_ffi

@@ -1,11 +1,14 @@
 [package]
 name = "basic_room"
 version = "0.1.0"
-edition = "2021"
+edition.workspace = true
+publish = false
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-env_logger = "0.10"
-livekit = { path = "../../livekit", features = ["rustls-tls-native-roots"]}
-livekit-api = { path = "../../livekit-api", features = ["rustls-tls-native-roots"]}
-log = "0.4"
+tokio = { workspace = true, features = ["full"] }
+env_logger = { workspace = true }
+livekit = { workspace = true, features = ["rustls-tls-native-roots"] }
+livekit-api = { workspace = true, features = ["rustls-tls-native-roots"] }
+log = { workspace = true }
+hound = { workspace = true }
+clap = { version = "4", features = ["derive"] }

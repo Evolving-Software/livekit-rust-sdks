@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+pub use cxx::SharedPtr;
 
-use cxx::SharedPtr;
+use std::sync::Arc;
 
 use crate::{
     candidate::ffi::Candidate, data_channel::ffi::DataChannel, impl_thread_safety,
@@ -22,7 +22,7 @@ use crate::{
     rtp_transceiver::ffi::RtpTransceiver,
 };
 
-#[cxx::bridge(namespace = "livekit")]
+#[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
     pub struct CandidatePair {
         local: SharedPtr<Candidate>,
@@ -88,6 +88,14 @@ pub mod ffi {
         type PeerConnectionFactory;
 
         fn create_peer_connection_factory() -> SharedPtr<PeerConnectionFactory>;
+        fn create_peer_connection_factory_with_zero_playout_delay(
+        ) -> SharedPtr<PeerConnectionFactory>;
+        fn create_peer_connection_factory_with_options(
+            zero_playout_delay: bool,
+            enable_warp: bool,
+        ) -> SharedPtr<PeerConnectionFactory>;
+
+        fn zero_playout_delay_enabled(self: &PeerConnectionFactory) -> bool;
 
         fn create_peer_connection(
             self: &PeerConnectionFactory,
@@ -105,6 +113,12 @@ pub mod ffi {
             self: &PeerConnectionFactory,
             label: String,
             source: SharedPtr<AudioTrackSource>,
+        ) -> SharedPtr<AudioTrack>;
+
+        // Create an audio track that uses the ADM for capture (Platform ADM mode)
+        fn create_device_audio_track(
+            self: &PeerConnectionFactory,
+            label: String,
         ) -> SharedPtr<AudioTrack>;
 
         fn rtp_sender_capabilities(

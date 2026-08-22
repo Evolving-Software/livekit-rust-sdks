@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -13,37 +13,47 @@
 // limitations under the License.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     convert::TryInto,
     fmt::Debug,
-    ops::Not,
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
 };
 
+use bytes::Bytes;
 use libwebrtc::{prelude::*, stats::RtcStats};
 use livekit_api::signal_client::{SignalClient, SignalEvent, SignalEvents};
-use livekit_protocol as proto;
+use livekit_datatrack::backend as dt;
+use livekit_protocol::{self as proto};
 use livekit_runtime::{sleep, JoinHandle};
 use parking_lot::Mutex;
 use prost::Message;
-use proto::{
-    debouncer::{self, Debouncer},
-    SignalTarget,
-};
+use proto::SignalTarget;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot, watch, Notify};
+use tokio::sync::{
+    mpsc::{self, WeakUnboundedSender},
+    oneshot, watch, Notify,
+};
 
 use super::{rtc_events, EngineError, EngineOptions, EngineResult, SimulateScenario};
-use crate::{id::ParticipantIdentity, ChatMessage, TranscriptionSegment};
+use crate::{
+    id::ParticipantIdentity,
+    rtc_engine::dc_sender::{DataChannelSender, DataChannelSenderOptions, DataTrackSendQueue},
+    utils::{
+        debouncer::{self, Debouncer},
+        ttl_map::TtlMap,
+        tx_queue::{TxQueue, TxQueueItem},
+    },
+    ChatMessage, TranscriptionSegment,
+};
 use crate::{
     id::ParticipantSid,
     options::TrackPublishOptions,
     prelude::TrackKind,
-    room::DisconnectReason,
+    room::{e2ee::manager::E2eeManager, DisconnectReason},
     rtc_engine::{
         lk_runtime::LkRuntime,
         peer_transport::PeerTransport,
@@ -57,8 +67,22 @@ pub const ICE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const TRACK_PUBLISH_TIMEOUT: Duration = Duration::from_secs(10);
 pub const LOSSY_DC_LABEL: &str = "_lossy";
 pub const RELIABLE_DC_LABEL: &str = "_reliable";
+pub const DATA_TRACK_DC_LABEL: &str = "_data_track";
+pub const RELIABLE_RECEIVED_STATE_TTL: Duration = Duration::from_secs(30);
 pub const PUBLISHER_NEGOTIATION_FREQUENCY: Duration = Duration::from_millis(150);
 pub const INITIAL_BUFFERED_AMOUNT_LOW_THRESHOLD: u64 = 2 * 1024 * 1024;
+
+/// Default data-channel max message size (bytes), used when the remote SDP
+/// answer does not advertise an `a=max-message-size` attribute (RFC 8841).
+pub const DEFAULT_MAX_MESSAGE_SIZE: u64 = 64000;
+
+/// Buffered-amount low threshold for the `_data_track` DC.
+///
+/// Kept small (vs. the 2 MiB default for reliable/lossy) so we hand at most
+/// one in-flight message to SCTP at a time; data tracks prefer dropping
+/// packets over queueing. Note that `bufferedAmount` only covers bytes
+/// before SCTP accepts them — queueing below that is bounded by OS/qdisc.
+pub const DATA_TRACK_BUFFERED_AMOUNT_LOW_THRESHOLD: u64 = 8 * 1024;
 
 #[derive(Debug)]
 enum NegotiationState {
@@ -106,6 +130,7 @@ pub enum SessionEvent {
         payload: Vec<u8>,
         topic: Option<String>,
         kind: DataPacketKind,
+        encryption_type: proto::encryption::Type,
     },
     ChatMessage {
         participant_identity: ParticipantIdentity,
@@ -167,10 +192,12 @@ pub enum SessionEvent {
     DataStreamHeader {
         header: proto::data_stream::Header,
         participant_identity: String,
+        encryption_type: proto::encryption::Type,
     },
     DataStreamChunk {
         chunk: proto::data_stream::Chunk,
         participant_identity: String,
+        encryption_type: proto::encryption::Type,
     },
     DataStreamTrailer {
         trailer: proto::data_stream::Trailer,
@@ -184,12 +211,135 @@ pub enum SessionEvent {
         url: String,
         token: String,
     },
+    TrackMuted {
+        sid: String,
+        muted: bool,
+    },
+    SubscribedQualityUpdate {
+        update: proto::SubscribedQualityUpdate,
+    },
+    LocalDataTrackInput(dt::local::InputEvent),
+    RemoteDataTrackInput(dt::remote::InputEvent),
 }
 
 #[derive(Debug)]
-enum DataChannelEvent {
-    PublishData(proto::DataPacket, DataPacketKind, oneshot::Sender<Result<(), EngineError>>),
-    BufferedAmountChange(u64, DataPacketKind),
+struct DataChannelEvent {
+    kind: DataPacketKind,
+    detail: DataChannelEventDetail,
+}
+
+#[derive(Debug)]
+enum DataChannelEventDetail {
+    /// Publish data packet.
+    PublishPacket(PublishPacketRequest),
+    /// Publish data packet that has already been encoded.
+    PublishData(PublishDataRequest),
+    /// RTC buffered amount changed.
+    BufferedAmountChange(u64),
+    /// Enqueue reliable packets for retry starting from the given sequence number.
+    RetryFrom(u32),
+}
+
+#[derive(Debug)]
+struct PublishPacketRequest {
+    /// Unencoded data packet.
+    packet: proto::DataPacket,
+
+    /// Notifies the caller once the request has been fulfilled.
+    completion_tx: oneshot::Sender<Result<(), EngineError>>,
+}
+
+#[derive(Debug)]
+struct PublishDataRequest {
+    /// Encoded data packet.
+    encoded_packet: EncodedPacket,
+
+    /// Notifies the caller once the request has been fulfilled.
+    ///
+    /// For retries, this will be `None`.
+    ///
+    completion_tx: Option<oneshot::Sender<Result<(), EngineError>>>,
+}
+
+#[derive(Debug)]
+struct EncodedPacket {
+    /// Encoded packet data.
+    data: Vec<u8>,
+    /// Packet's sequence number from [`proto::DataPacket::sequence`].
+    sequence: u32,
+}
+
+impl Into<EncodedPacket> for proto::DataPacket {
+    fn into(self) -> EncodedPacket {
+        EncodedPacket { data: self.encode_to_vec(), sequence: self.sequence }
+    }
+}
+
+fn convert_encrypted_to_data_packet_value(
+    encrypted_value: proto::encrypted_packet_payload::Value,
+) -> proto::data_packet::Value {
+    match encrypted_value {
+        proto::encrypted_packet_payload::Value::User(user) => proto::data_packet::Value::User(user),
+        proto::encrypted_packet_payload::Value::ChatMessage(msg) => {
+            proto::data_packet::Value::ChatMessage(msg)
+        }
+        proto::encrypted_packet_payload::Value::RpcRequest(req) => {
+            proto::data_packet::Value::RpcRequest(req)
+        }
+        proto::encrypted_packet_payload::Value::RpcResponse(resp) => {
+            proto::data_packet::Value::RpcResponse(resp)
+        }
+        proto::encrypted_packet_payload::Value::RpcAck(ack) => {
+            proto::data_packet::Value::RpcAck(ack)
+        }
+        proto::encrypted_packet_payload::Value::StreamHeader(header) => {
+            proto::data_packet::Value::StreamHeader(header)
+        }
+        proto::encrypted_packet_payload::Value::StreamChunk(chunk) => {
+            proto::data_packet::Value::StreamChunk(chunk)
+        }
+        proto::encrypted_packet_payload::Value::StreamTrailer(trailer) => {
+            proto::data_packet::Value::StreamTrailer(trailer)
+        }
+    }
+}
+
+fn convert_data_packet_to_encrypted_value(
+    value: proto::data_packet::Value,
+) -> Option<proto::encrypted_packet_payload::Value> {
+    match value {
+        proto::data_packet::Value::User(user) => {
+            Some(proto::encrypted_packet_payload::Value::User(user))
+        }
+        proto::data_packet::Value::ChatMessage(msg) => {
+            Some(proto::encrypted_packet_payload::Value::ChatMessage(msg))
+        }
+        proto::data_packet::Value::RpcRequest(req) => {
+            Some(proto::encrypted_packet_payload::Value::RpcRequest(req))
+        }
+        proto::data_packet::Value::RpcResponse(resp) => {
+            Some(proto::encrypted_packet_payload::Value::RpcResponse(resp))
+        }
+        proto::data_packet::Value::RpcAck(ack) => {
+            Some(proto::encrypted_packet_payload::Value::RpcAck(ack))
+        }
+        proto::data_packet::Value::StreamHeader(header) => {
+            Some(proto::encrypted_packet_payload::Value::StreamHeader(header))
+        }
+        proto::data_packet::Value::StreamChunk(chunk) => {
+            Some(proto::encrypted_packet_payload::Value::StreamChunk(chunk))
+        }
+        proto::data_packet::Value::StreamTrailer(trailer) => {
+            Some(proto::encrypted_packet_payload::Value::StreamTrailer(trailer))
+        }
+        _ => None,
+    }
+}
+
+impl TxQueueItem for EncodedPacket {
+    fn buffered_size(&self) -> usize {
+        self.data.len()
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -207,7 +357,26 @@ struct SessionInner {
     fast_publish: AtomicBool,
 
     publisher_pc: PeerTransport,
-    subscriber_pc: PeerTransport,
+    /// In single peer connection mode, this is None and publisher_pc handles both send/receive
+    subscriber_pc: Option<PeerTransport>,
+    /// Whether single peer connection mode is active
+    single_pc_mode: bool,
+    /// Mapping from SDP mid to track ID, used for track resolution in single PC mode
+    mid_to_track_id: Mutex<HashMap<String, String>>,
+
+    /// `(mid, stream_id)` pairs we've already dispatched as
+    /// `SessionEvent::MediaTrack`.
+    ///
+    /// libwebrtc-native's `OnTrack` callback only fires when a transceiver is
+    /// first created — it does NOT refire when an existing transceiver's
+    /// receiver gains a new associated `MediaStream` via an msid update
+    /// (e.g. an SFU reusing an empty transceiver slot for a new subscription).
+    /// Browsers paper over this by running the W3C "process the addition of
+    /// remote tracks" algorithm in blink (RTCPeerConnection::DidModifyTransceivers
+    /// in third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc),
+    /// diffing receiver streams across each setRemoteDescription and dispatching
+    /// `track` events for newly-added streams.
+    dispatched_streams: Mutex<HashSet<(String, String)>>,
 
     pending_tracks: Mutex<HashMap<String, oneshot::Sender<proto::TrackInfo>>>,
 
@@ -217,14 +386,51 @@ struct SessionInner {
     lossy_dc_buffered_amount_low_threshold: AtomicU64,
     reliable_dc: DataChannel,
     reliable_dc_buffered_amount_low_threshold: AtomicU64,
+    data_track_dc: DataChannel,
+
+    /// Negotiated SCTP max message size (bytes), parsed from the publisher
+    /// answer SDP (`a=max-message-size`). `0` means "no limit". Defaults to
+    /// [`DEFAULT_MAX_MESSAGE_SIZE`] until an answer is received.
+    max_message_size: AtomicU64,
+
+    /// Next sequence number for reliable packets.
+    next_packet_sequence: AtomicU32,
+
+    /// Time to live (TTL) map between publisher SID and last sequence number.
+    packet_rx_state: Mutex<TtlMap<String, u32>>,
+
+    participant_info: SessionParticipantInfo,
+
+    /// `Some` while a signal resume is in flight: accumulates the identity of
+    /// every participant mentioned in `Update`s since the resume began. The
+    /// server sends a full participant snapshot right after the
+    /// `ReconnectResponse` but may interleave delayed/batched updates around
+    /// it, so no single `Update` is identifiable as the snapshot — the union
+    /// is what's guaranteed to cover everyone still in the room once the
+    /// resume settles (see [`RtcSession::finish_resume`]).
+    resume_seen_identities: Mutex<Option<HashSet<ParticipantIdentity>>>,
+
+    /// Test-only: drop incoming DISCONNECTED participant entries, simulating
+    /// an SFU that fails to (re)deliver disconnect updates. Lets tests
+    /// exercise the resume-time participant reconciliation deterministically.
+    #[cfg(feature = "__lk-e2e-test")]
+    drop_disconnected_updates: AtomicBool,
+
     dc_emitter: mpsc::UnboundedSender<DataChannelEvent>,
 
     // Keep a strong reference to the subscriber datachannels,
     // so we can receive data from other participants
     sub_lossy_dc: Mutex<Option<DataChannel>>,
     sub_reliable_dc: Mutex<Option<DataChannel>>,
+    sub_data_track_dc: Mutex<Option<DataChannel>>,
+
+    /// Drop-oldest queue for handing data-track packets to the sender task.
+    dt_packet_tx: DataTrackSendQueue,
 
     closed: AtomicBool,
+    // Set on a terminal disconnect (server `Leave{Disconnect}`) so the publisher
+    // data-channel close it triggers isn't logged as unexpected
+    disconnecting: AtomicBool,
     emitter: SessionEmitter,
 
     options: EngineOptions,
@@ -232,6 +438,33 @@ struct SessionInner {
     negotiation_queue: NegotiationQueue,
 
     pending_requests: Mutex<HashMap<u32, oneshot::Sender<proto::RequestResponse>>>,
+
+    pending_store_data_blob_requests:
+        Mutex<HashMap<u32, oneshot::Sender<proto::StoreDataBlobResponse>>>,
+    pending_get_data_blob_requests:
+        Mutex<HashMap<u32, oneshot::Sender<proto::GetDataBlobResponse>>>,
+
+    e2ee_manager: Option<E2eeManager>,
+    subscriber_primary: bool,
+    pc_state_notify: Notify,
+}
+
+/// Information about the local participant needed for outgoing
+/// data packets.
+struct SessionParticipantInfo {
+    sid: ParticipantSid,
+    identity: ParticipantIdentity,
+}
+
+impl SessionParticipantInfo {
+    /// Extracts participant info from a join response.
+    fn from_join(join_response: &proto::JoinResponse) -> Option<Self> {
+        let Some(info) = &join_response.participant else { None? };
+        Some(Self {
+            sid: info.sid.clone().try_into().ok()?,
+            identity: info.identity.clone().try_into().ok()?,
+        })
+    }
 }
 
 /// This struct holds a WebRTC session
@@ -254,58 +487,134 @@ struct SessionHandle {
     signal_task: JoinHandle<()>,
     rtc_task: JoinHandle<()>,
     dc_task: JoinHandle<()>,
+    dt_sender_task: JoinHandle<()>,
 }
 
 impl RtcSession {
+    /// Connect to a LiveKit room.
     pub async fn connect(
         url: &str,
         token: &str,
         options: EngineOptions,
+        e2ee_manager: Option<E2eeManager>,
     ) -> EngineResult<(Self, proto::JoinResponse, SessionEvents)> {
         let (emitter, session_events) = mpsc::unbounded_channel();
 
-        let (signal_client, join_response, signal_events) =
-            SignalClient::connect(url, token, options.signal_options.clone()).await?;
+        let lk_runtime = LkRuntime::instance();
+
+        let mut options = options;
+        options.rtc_config.enable_sctp_snap = true;
+
+        let use_single_pc = options.signal_options.single_peer_connection;
+
+        let mut publisher_offer = None;
+        let early_publisher_pc = if use_single_pc {
+            let publisher_pc = PeerTransport::new(
+                lk_runtime.pc_factory().create_peer_connection(options.rtc_config.clone())?,
+                proto::SignalTarget::Publisher,
+                true,
+            );
+
+            let dcs = Self::create_data_channels(&publisher_pc, &emitter)?;
+
+            Self::add_recv_media_sections(&publisher_pc.peer_connection(), 3, 3)?;
+
+            match publisher_pc.create_initial_offer().await {
+                Ok(Some(offer)) => {
+                    publisher_offer = Some(proto::SessionDescription {
+                        r#type: "offer".to_string(),
+                        sdp: offer.to_string(),
+                        id: 0,
+                        mid_to_track_id: Default::default(),
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    log::warn!("failed to create initial publisher offer: {:?}", err);
+                }
+            }
+
+            Some((publisher_pc, dcs))
+        } else {
+            None
+        };
+
+        let (signal_client, mut join_response, signal_events) = SignalClient::connect(
+            url,
+            token,
+            options.signal_options.clone(),
+            publisher_offer.clone(),
+        )
+        .await?;
         let signal_client = Arc::new(signal_client);
         log::debug!("received JoinResponse: {:?}", join_response);
+        let subscriber_primary = join_response.subscriber_primary;
+
+        // Determine if single PC mode is active based on the path used
+        let single_pc_mode = signal_client.is_single_pc_mode_active();
+
+        let Some(participant_info) = SessionParticipantInfo::from_join(&join_response) else {
+            Err(EngineError::Internal("Join response missing participant info".into()))?
+        };
+        if let Ok(initial_publications) = dt::remote::event_from_join(&mut join_response) {
+            _ = emitter.send(SessionEvent::RemoteDataTrackInput(initial_publications.into()));
+        }
 
         let (rtc_emitter, rtc_events) = mpsc::unbounded_channel();
         let rtc_config = make_rtc_config_join(join_response.clone(), options.rtc_config.clone());
 
         let (dc_emitter, dc_events) = mpsc::unbounded_channel();
 
-        let lk_runtime = LkRuntime::instance();
-        let mut publisher_pc = PeerTransport::new(
-            lk_runtime.pc_factory().create_peer_connection(rtc_config.clone())?,
-            proto::SignalTarget::Publisher,
-        );
+        let sent_publisher_offer;
+        let (mut publisher_pc, mut reliable_dc, mut lossy_dc, data_track_dc) =
+            if let Some((pub_pc, dcs)) = early_publisher_pc {
+                if single_pc_mode {
+                    pub_pc.peer_connection().set_configuration(rtc_config.clone())?;
+                    sent_publisher_offer = publisher_offer.is_some();
+                } else {
+                    pub_pc.clear_pending_initial_offer().await;
+                    pub_pc.peer_connection().set_configuration(rtc_config.clone())?;
+                    sent_publisher_offer = false;
+                }
+                (pub_pc, dcs.0, dcs.1, dcs.2)
+            } else {
+                sent_publisher_offer = false;
+                let publisher_pc = PeerTransport::new(
+                    lk_runtime.pc_factory().create_peer_connection(rtc_config.clone())?,
+                    proto::SignalTarget::Publisher,
+                    single_pc_mode,
+                );
+                let dcs = Self::create_data_channels(&publisher_pc, &emitter)?;
+                (publisher_pc, dcs.0, dcs.1, dcs.2)
+            };
 
-        let mut subscriber_pc = PeerTransport::new(
-            lk_runtime.pc_factory().create_peer_connection(rtc_config)?,
-            proto::SignalTarget::Subscriber,
-        );
-
-        let mut lossy_dc = publisher_pc.peer_connection().create_data_channel(
-            LOSSY_DC_LABEL,
-            DataChannelInit {
-                ordered: false,
-                max_retransmits: Some(0),
-                ..DataChannelInit::default()
-            },
-        )?;
-
-        let mut reliable_dc = publisher_pc.peer_connection().create_data_channel(
-            RELIABLE_DC_LABEL,
-            DataChannelInit { ordered: true, ..DataChannelInit::default() },
-        )?;
+        // In single PC mode, subscriber_pc is None
+        let mut subscriber_pc = if single_pc_mode {
+            None
+        } else {
+            Some(PeerTransport::new(
+                lk_runtime.pc_factory().create_peer_connection(rtc_config)?,
+                proto::SignalTarget::Subscriber,
+                false,
+            ))
+        };
 
         // Forward events received inside the signaling thread to our rtc channel
         rtc_events::forward_pc_events(&mut publisher_pc, rtc_emitter.clone());
-        rtc_events::forward_pc_events(&mut subscriber_pc, rtc_emitter.clone());
+        if let Some(ref mut sub_pc) = subscriber_pc {
+            rtc_events::forward_pc_events(sub_pc, rtc_emitter.clone());
+        }
         rtc_events::forward_dc_events(&mut lossy_dc, DataPacketKind::Lossy, rtc_emitter.clone());
         rtc_events::forward_dc_events(&mut reliable_dc, DataPacketKind::Reliable, rtc_emitter);
 
         let (close_tx, close_rx) = watch::channel(false);
+
+        let dt_sender_options = DataChannelSenderOptions {
+            low_buffer_threshold: DATA_TRACK_BUFFERED_AMOUNT_LOW_THRESHOLD,
+            dc: data_track_dc.clone(),
+            close_rx: close_rx.clone(),
+        };
+        let (dt_sender, dt_packet_tx) = DataChannelSender::new(dt_sender_options);
 
         let inner = Arc::new(SessionInner {
             has_published: Default::default(),
@@ -313,6 +622,9 @@ impl RtcSession {
             signal_client,
             publisher_pc,
             subscriber_pc,
+            single_pc_mode,
+            mid_to_track_id: Mutex::new(HashMap::new()),
+            dispatched_streams: Mutex::new(HashSet::new()),
             pending_tracks: Default::default(),
             lossy_dc,
             lossy_dc_buffered_amount_low_threshold: AtomicU64::new(
@@ -322,31 +634,142 @@ impl RtcSession {
             reliable_dc_buffered_amount_low_threshold: AtomicU64::new(
                 INITIAL_BUFFERED_AMOUNT_LOW_THRESHOLD,
             ),
+            data_track_dc,
+            max_message_size: AtomicU64::new(DEFAULT_MAX_MESSAGE_SIZE),
+            next_packet_sequence: 1.into(),
+            packet_rx_state: Mutex::new(TtlMap::new(RELIABLE_RECEIVED_STATE_TTL)),
+            participant_info,
+            resume_seen_identities: Mutex::new(None),
+            #[cfg(feature = "__lk-e2e-test")]
+            drop_disconnected_updates: Default::default(),
             dc_emitter,
             sub_lossy_dc: Mutex::new(None),
             sub_reliable_dc: Mutex::new(None),
+            sub_data_track_dc: Mutex::new(None),
+            dt_packet_tx,
             closed: Default::default(),
+            disconnecting: Default::default(),
             emitter,
             options,
             negotiation_debouncer: Default::default(),
             negotiation_queue: NegotiationQueue::new(),
             pending_requests: Default::default(),
+            pending_get_data_blob_requests: Default::default(),
+            pending_store_data_blob_requests: Default::default(),
+            e2ee_manager,
+            subscriber_primary,
+            pc_state_notify: Notify::new(),
         });
+
+        // Log when a publisher data channel closes without the engine or peer
+        // connection tearing it down
+        for (dc, label) in [
+            (&inner.reliable_dc, RELIABLE_DC_LABEL),
+            (&inner.lossy_dc, LOSSY_DC_LABEL),
+            (&inner.data_track_dc, DATA_TRACK_DC_LABEL),
+        ] {
+            let weak_inner = Arc::downgrade(&inner);
+            dc.on_state_change(Some(Box::new(move |state| {
+                if state != DataChannelState::Closed {
+                    return;
+                }
+                let Some(inner) = weak_inner.upgrade() else {
+                    return;
+                };
+                if !inner.closed.load(Ordering::Acquire)
+                    && !inner.disconnecting.load(Ordering::Acquire)
+                    && inner.publisher_pc.is_connected()
+                {
+                    log::error!("publisher data channel '{}' closed unexpectedly", label);
+                }
+            })));
+        }
 
         // Start session tasks
         let signal_task =
             livekit_runtime::spawn(inner.clone().signal_task(signal_events, close_rx.clone()));
         let rtc_task =
             livekit_runtime::spawn(inner.clone().rtc_session_task(rtc_events, close_rx.clone()));
-        let dc_task = livekit_runtime::spawn(inner.clone().data_channel_task(dc_events, close_rx));
+        let dc_task =
+            livekit_runtime::spawn(inner.clone().data_channel_task(dc_events, close_rx.clone()));
+        let dt_sender_task = livekit_runtime::spawn(dt_sender.run());
 
-        let handle = Mutex::new(Some(SessionHandle { close_tx, signal_task, rtc_task, dc_task }));
+        let handle = Mutex::new(Some(SessionHandle {
+            close_tx,
+            signal_task,
+            rtc_task,
+            dc_task,
+            dt_sender_task,
+        }));
+
+        // If we already sent the publisher offer with the JoinRequest, skip initial
+        // negotiation - the server will respond with an answer via the signal channel.
+        // Otherwise, trigger negotiation as before.
+        if sent_publisher_offer {
+            inner.has_published.store(true, Ordering::Release);
+        } else if single_pc_mode || join_response.fast_publish || !subscriber_primary {
+            inner.publisher_negotiation_needed();
+        }
 
         Ok((Self { inner, handle }, join_response, session_events))
     }
 
+    fn create_data_channels(
+        publisher_pc: &PeerTransport,
+        emitter: &mpsc::UnboundedSender<SessionEvent>,
+    ) -> EngineResult<(DataChannel, DataChannel, DataChannel)> {
+        let reliable_dc = publisher_pc.peer_connection().create_data_channel(
+            RELIABLE_DC_LABEL,
+            DataChannelInit { ordered: true, ..Default::default() },
+        )?;
+
+        let lossy_options =
+            DataChannelInit { ordered: false, max_retransmits: Some(0), ..Default::default() };
+
+        let lossy_dc = publisher_pc
+            .peer_connection()
+            .create_data_channel(LOSSY_DC_LABEL, lossy_options.clone())?;
+
+        let data_track_dc = publisher_pc
+            .peer_connection()
+            .create_data_channel(DATA_TRACK_DC_LABEL, lossy_options)?;
+        handle_remote_dt_packets(&data_track_dc, emitter.downgrade());
+
+        Ok((reliable_dc, lossy_dc, data_track_dc))
+    }
+
+    fn add_recv_media_sections(
+        pc: &PeerConnection,
+        audio_count: u32,
+        video_count: u32,
+    ) -> EngineResult<()> {
+        let recvonly_init = RtpTransceiverInit {
+            direction: RtpTransceiverDirection::RecvOnly,
+            stream_ids: Vec::new(),
+            send_encodings: Vec::new(),
+        };
+
+        for _ in 0..audio_count {
+            pc.add_transceiver_for_media(MediaType::Audio, recvonly_init.clone())?;
+        }
+        for _ in 0..video_count {
+            pc.add_transceiver_for_media(MediaType::Video, recvonly_init.clone())?;
+        }
+        Ok(())
+    }
+
     pub fn has_published(&self) -> bool {
         self.inner.has_published.load(Ordering::Acquire)
+    }
+
+    /// Returns whether single peer connection mode is active
+    pub fn is_single_pc_mode(&self) -> bool {
+        self.inner.single_pc_mode
+    }
+
+    /// Get the track ID for a given SDP mid (used in single PC mode)
+    pub fn get_track_id_for_mid(&self, mid: &str) -> Option<String> {
+        self.inner.mid_to_track_id.lock().get(mid).cloned()
     }
 
     pub fn remove_track(&self, sender: RtpSender) -> EngineResult<()> {
@@ -375,7 +798,7 @@ impl RtcSession {
     }
 
     /// Close the PeerConnections and the SignalClient
-    pub async fn close(&self) {
+    pub async fn close(&self, reason: DisconnectReason) {
         // Close the tasks
         let handle = self.handle.lock().take();
         if let Some(handle) = handle {
@@ -383,19 +806,21 @@ impl RtcSession {
             let _ = handle.rtc_task.await;
             let _ = handle.signal_task.await;
             let _ = handle.dc_task.await;
+            let _ = handle.dt_sender_task.await;
         }
 
         // Close the PeerConnections after the task
         // So if a sensitive operation is running, we can wait for it
-        self.inner.close().await;
+        self.inner.close(reason).await;
     }
 
     pub async fn publish_data(
         &self,
         data: proto::DataPacket,
         kind: DataPacketKind,
+        is_raw_packet: bool,
     ) -> Result<(), EngineError> {
-        self.inner.publish_data(data, kind).await
+        self.inner.publish_data(data, kind, is_raw_packet).await
     }
 
     pub async fn restart(&self) -> EngineResult<proto::ReconnectResponse> {
@@ -406,8 +831,42 @@ impl RtcSession {
         self.inner.restart_publisher().await
     }
 
+    /// Ends the resume-time accumulation started by [`Self::restart`],
+    /// returning the participant identities seen since. The post-resume
+    /// snapshot arrived several round trips before the PeerConnections
+    /// finished reconnecting, so this is a superset of the room's current
+    /// participants: any known participant absent from it left while the
+    /// signal link was down and its disconnection must be synthesized.
+    /// Returns `None` if no resume was in flight.
+    pub fn finish_resume(&self) -> Option<HashSet<ParticipantIdentity>> {
+        self.inner.resume_seen_identities.lock().take()
+    }
+
+    /// Test-only: drop incoming DISCONNECTED participant entries, simulating
+    /// an SFU that fails to (re)deliver disconnect updates.
+    #[cfg(feature = "__lk-e2e-test")]
+    pub fn drop_disconnected_updates(&self, enabled: bool) {
+        self.inner.drop_disconnected_updates.store(enabled, Ordering::Release);
+    }
+
     pub async fn wait_pc_connection(&self) -> EngineResult<()> {
         self.inner.wait_pc_connection().await
+    }
+
+    /// Wait for PCs to be connected on the resume path.
+    ///
+    /// Sleeps `settle_delay` before polling, giving the just-issued ICE
+    /// restart offer/answer round-trip a chance to take effect when the
+    /// failure was signal-only (PCs may still report `Connected` immediately
+    /// after a WS hiccup, even though the new ufrag/pwd hasn't propagated yet).
+    pub async fn wait_pc_reconnected(&self, settle_delay: Duration) -> EngineResult<()> {
+        self.inner.wait_pc_connection_with_delay(settle_delay).await
+    }
+
+    /// Ensure the publisher peer connection is connected and the data channel is open.
+    /// This triggers negotiation if needed and waits for the connection to be established.
+    pub async fn ensure_publisher_connected(&self) -> EngineResult<()> {
+        self.inner.ensure_publisher_connected(DataPacketKind::Reliable).await
     }
 
     pub async fn simulate_scenario(&self, scenario: SimulateScenario) -> EngineResult<()> {
@@ -417,7 +876,12 @@ impl RtcSession {
     pub async fn get_stats(&self) -> EngineResult<SessionStats> {
         let publisher_stats = self.inner.publisher_pc.peer_connection().get_stats().await?;
 
-        let subscriber_stats = self.inner.subscriber_pc.peer_connection().get_stats().await?;
+        let subscriber_stats = if let Some(ref sub_pc) = self.inner.subscriber_pc {
+            sub_pc.peer_connection().get_stats().await?
+        } else {
+            // In single PC mode, there's no separate subscriber stats
+            Vec::new()
+        };
 
         Ok(SessionStats { publisher_stats, subscriber_stats })
     }
@@ -426,8 +890,8 @@ impl RtcSession {
         &self.inner.publisher_pc
     }
 
-    pub fn subscriber(&self) -> &PeerTransport {
-        &self.inner.subscriber_pc
+    pub fn subscriber(&self) -> Option<&PeerTransport> {
+        self.inner.subscriber_pc.as_ref()
     }
 
     pub fn signal_client(&self) -> &Arc<SignalClient> {
@@ -436,6 +900,65 @@ impl RtcSession {
 
     pub fn data_channel(&self, target: SignalTarget, kind: DataPacketKind) -> Option<DataChannel> {
         self.inner.data_channel(target, kind)
+    }
+
+    /// Handles an event from the local data track manager.
+    pub(super) async fn handle_local_data_track_output(&self, event: dt::local::OutputEvent) {
+        use dt::local::OutputEvent;
+        match event {
+            OutputEvent::SfuPublishRequest(event) => {
+                if let Err(err) = self.inner.ensure_data_track_publisher_connected().await {
+                    log::error!("Failed to open data track publish transport: {}", err);
+                }
+                self.signal_client()
+                    .send(proto::signal_request::Message::PublishDataTrackRequest(event.into()))
+                    .await
+            }
+            OutputEvent::SfuUnpublishRequest(event) => {
+                self.signal_client()
+                    .send(proto::signal_request::Message::UnpublishDataTrackRequest(event.into()))
+                    .await
+            }
+            OutputEvent::PacketsAvailable(packets) => self.try_send_data_track_packets(packets),
+        }
+    }
+
+    /// Handles an event from the remote data track manager.
+    pub(super) async fn handle_remote_data_track_output(&self, event: dt::remote::OutputEvent) {
+        use dt::remote::OutputEvent;
+        match event.into() {
+            OutputEvent::SfuUpdateSubscription(event) => {
+                self.signal_client()
+                    .send(proto::signal_request::Message::UpdateDataSubscription(event.into()))
+                    .await
+            }
+            _ => {}
+        }
+    }
+
+    /// Try to send data track packets over the transport.
+    ///
+    /// All packets belong to one application frame and are enqueued atomically
+    /// so a partial frame is never queued or evicted; drop-oldest applies at
+    /// whole-frame granularity.
+    fn try_send_data_track_packets(&self, packets: Vec<Bytes>) {
+        if packets.is_empty() {
+            return;
+        }
+        let packet_count = packets.len();
+        if let Some(stale) = self.inner.dt_packet_tx.send(packets) {
+            let stale_bytes: usize = stale.iter().map(|p| p.len()).sum();
+            log::trace!(
+                "evicted oldest queued data-track frame ({} packets / {} total bytes) in favor of newer {}-packet frame",
+                stale.len(),
+                stale_bytes,
+                packet_count,
+            );
+        }
+    }
+
+    pub fn e2ee_manager(&self) -> Option<E2eeManager> {
+        self.inner.e2ee_manager.clone()
     }
 
     pub fn data_channel_buffered_amount_low_threshold(&self, kind: DataPacketKind) -> u64 {
@@ -470,12 +993,63 @@ impl RtcSession {
             .send(SessionEvent::DataChannelBufferedAmountLowThresholdChanged { kind, threshold });
     }
 
+    pub fn data_channel_receive_states(&self) -> Vec<proto::DataChannelReceiveState> {
+        self.inner.data_channel_receive_states()
+    }
+
     pub async fn get_response(&self, request_id: u32) -> proto::RequestResponse {
         self.inner.get_response(request_id).await
+    }
+
+    /// Awaits the successful [`GetDataBlobResponse`][proto::GetDataBlobResponse] for `request_id`.
+    pub async fn get_data_blob_response(&self, request_id: u32) -> proto::GetDataBlobResponse {
+        self.inner.get_data_blob_response(request_id).await
+    }
+
+    /// Awaits the successful [`StoreDataBlobResponse`][proto::StoreDataBlobResponse] for `request_id`.
+    pub async fn store_data_blob_response(&self, request_id: u32) -> proto::StoreDataBlobResponse {
+        self.inner.store_data_blob_response(request_id).await
     }
 }
 
 impl SessionInner {
+    /// Walks the given peer connection's transceivers and synthesizes a
+    /// `SessionEvent::MediaTrack` for any `(mid, stream_id)` pair we
+    /// haven't already dispatched.
+    ///
+    /// Mirrors `RTCPeerConnection::DidModifyTransceivers` in Chromium's
+    /// blink renderer:
+    /// `third_party/blink/renderer/modules/peerconnection/rtc_peer_connection.cc`.
+    fn process_remote_track_addition(&self, pc: &libwebrtc::peer_connection::PeerConnection) {
+        let mut current =
+            HashMap::<(String, String), (MediaStream, MediaStreamTrack, RtpTransceiver)>::new();
+        for transceiver in pc.transceivers() {
+            let Some(mid) = transceiver.mid() else { continue };
+            let receiver = transceiver.receiver();
+            let Some(track) = receiver.track() else { continue };
+            for stream in receiver.streams() {
+                let stream_id = stream.id();
+                current
+                    .entry((mid.clone(), stream_id))
+                    .or_insert_with(|| (stream, track.clone(), transceiver.clone()));
+            }
+        }
+
+        let mut dispatched = self.dispatched_streams.lock();
+        dispatched.retain(|key| current.contains_key(key));
+
+        for (key, (stream, track, transceiver)) in current {
+            if dispatched.insert(key.clone()) {
+                log::debug!(
+                    "blink-diff: synthesizing MediaTrack for mid={}, stream_id={}",
+                    key.0,
+                    key.1
+                );
+                let _ = self.emitter.send(SessionEvent::MediaTrack { stream, track, transceiver });
+            }
+        }
+    }
+
     async fn rtc_session_task(
         self: Arc<Self>,
         mut rtc_events: RtcEvents,
@@ -574,6 +1148,7 @@ impl SessionInner {
         let mut reliable_buffered_amount = 0;
         let mut lossy_queue = VecDeque::new();
         let mut reliable_queue = VecDeque::new();
+        let mut retry_queue = TxQueue::new();
 
         loop {
             tokio::select! {
@@ -583,24 +1158,57 @@ impl SessionInner {
                         break;
                     };
 
-                    match event {
-                        DataChannelEvent::PublishData(packet, kind, tx) => {
-                            let data = packet.encode_to_vec();
-                            match kind {
+                    match event.detail {
+                        DataChannelEventDetail::PublishPacket(mut request) => {
+                            if event.kind == DataPacketKind::Reliable {
+                                request.packet.sequence = self.next_packet_sequence.fetch_add(1, Ordering::Relaxed);
+                            }
+                            let encoded_packet: EncodedPacket = request.packet.into();
+
+                            let max_message_size = self.max_message_size.load(Ordering::Acquire);
+                            if max_message_size != 0
+                                && encoded_packet.data.len() as u64 > max_message_size
+                            {
+                                let err = EngineError::Internal(
+                                    format!(
+                                        "data packet size ({} bytes) exceeds the negotiated maximum message size ({} bytes)",
+                                        encoded_packet.data.len(),
+                                        max_message_size
+                                    )
+                                    .into(),
+                                );
+                                log::warn!("{}", err);
+                                _ = request.completion_tx.send(Err(err));
+                                continue;
+                            }
+
+                            let ev = DataChannelEvent {
+                                kind: event.kind,
+                                detail: DataChannelEventDetail::PublishData(PublishDataRequest {
+                                    encoded_packet,
+                                    completion_tx: request.completion_tx.into(),
+                                })
+                            };
+                            if let Err(err) = self.dc_emitter.send(ev) {
+                                log::error!("Failed to enqueue send data request: {}", err)
+                            }
+                        }
+                        DataChannelEventDetail::PublishData(request) => {
+                            match event.kind {
                                 DataPacketKind::Lossy => {
-                                    lossy_queue.push_back((data, kind, tx));
+                                    lossy_queue.push_back(request);
                                     let threshold = self.lossy_dc_buffered_amount_low_threshold.load(Ordering::Relaxed);
-                                    self._send_until_threshold(threshold, &mut lossy_buffered_amount, &mut lossy_queue);
+                                    self._send_until_threshold(DataPacketKind::Lossy, threshold, &mut lossy_buffered_amount, &mut lossy_queue, &mut retry_queue);
                                 }
                                 DataPacketKind::Reliable => {
-                                    reliable_queue.push_back((data, kind, tx));
+                                    reliable_queue.push_back(request);
                                     let threshold = self.reliable_dc_buffered_amount_low_threshold.load(Ordering::Relaxed);
-                                    self._send_until_threshold(threshold, &mut reliable_buffered_amount, &mut reliable_queue);
+                                    self._send_until_threshold(DataPacketKind::Reliable, threshold, &mut reliable_buffered_amount, &mut reliable_queue, &mut retry_queue);
                                 }
                             }
                         }
-                        DataChannelEvent::BufferedAmountChange(sent, kind) => {
-                            match kind {
+                        DataChannelEventDetail::BufferedAmountChange(sent) => {
+                            match event.kind {
                                 DataPacketKind::Lossy => {
                                     if lossy_buffered_amount < sent {
                                         // I believe never reach here but adding logs just in case
@@ -610,7 +1218,7 @@ impl SessionInner {
                                         lossy_buffered_amount -= sent;
                                     }
                                     let threshold = self.lossy_dc_buffered_amount_low_threshold.load(Ordering::Relaxed);
-                                    self._send_until_threshold(threshold, &mut lossy_buffered_amount, &mut lossy_queue);
+                                    self._send_until_threshold(DataPacketKind::Lossy, threshold, &mut lossy_buffered_amount, &mut lossy_queue, &mut retry_queue);
                                 }
                                 DataPacketKind::Reliable => {
                                     if reliable_buffered_amount < sent {
@@ -620,9 +1228,14 @@ impl SessionInner {
                                         reliable_buffered_amount -= sent;
                                     }
                                     let threshold = self.reliable_dc_buffered_amount_low_threshold.load(Ordering::Relaxed);
-                                    self._send_until_threshold(threshold, &mut reliable_buffered_amount, &mut reliable_queue);
+                                    self._send_until_threshold(DataPacketKind::Reliable, threshold, &mut reliable_buffered_amount, &mut reliable_queue, &mut retry_queue);
+                                    retry_queue.trim(sent as usize);
                                 }
                             }
+                        }
+                        DataChannelEventDetail::RetryFrom(last_sequence) => {
+                            assert!(event.kind == DataPacketKind::Reliable);
+                            self._enqueue_for_retry_from(last_sequence, &mut retry_queue);
                         }
                     }
                 },
@@ -638,35 +1251,115 @@ impl SessionInner {
 
     fn _send_until_threshold(
         self: &Arc<Self>,
+        kind: DataPacketKind,
         threshold: u64,
         buffered_amount: &mut u64,
-        queue: &mut VecDeque<(Vec<u8>, DataPacketKind, oneshot::Sender<Result<(), EngineError>>)>,
+        request_queue: &mut VecDeque<PublishDataRequest>,
+        retry_queue: &mut TxQueue<EncodedPacket>,
     ) {
         while *buffered_amount <= threshold {
-            let Some((data, kind, tx)) = queue.pop_front() else {
+            let Some(request) = request_queue.pop_front() else {
                 break;
             };
 
-            *buffered_amount += data.len() as u64;
+            *buffered_amount += request.encoded_packet.data.len() as u64;
             let result = self
                 .data_channel(SignalTarget::Publisher, kind)
                 .unwrap()
-                .send(&data, true)
+                .send(&request.encoded_packet.data, true)
                 .map_err(|err| {
                     EngineError::Internal(format!("failed to send data packet: {:?}", err).into())
                 });
 
-            let _ = tx.send(result);
+            if let Some(completion_tx) = request.completion_tx {
+                _ = completion_tx.send(result);
+            }
+            if kind == DataPacketKind::Reliable {
+                retry_queue.enqueue(request.encoded_packet);
+            }
         }
     }
 
-    async fn on_signal_event(&self, event: proto::signal_response::Message) -> EngineResult<()> {
+    fn _enqueue_for_retry_from(
+        self: &Arc<Self>,
+        last_sequence: u32,
+        retry_queue: &mut TxQueue<EncodedPacket>,
+    ) {
+        if let Some(first) = retry_queue.peek() {
+            if first.sequence > last_sequence + 1 {
+                log::warn!(
+                    "Wrong packet sequence while retrying: {} > {}, {} packets missing",
+                    first.sequence,
+                    last_sequence + 1,
+                    first.sequence - last_sequence - 1
+                );
+            }
+        }
+
+        while let Some(encoded_packet) = retry_queue.dequeue() {
+            if encoded_packet.sequence <= last_sequence {
+                continue;
+            };
+            let ev = DataChannelEvent {
+                kind: DataPacketKind::Reliable,
+                detail: DataChannelEventDetail::PublishData(PublishDataRequest {
+                    encoded_packet,
+                    completion_tx: None,
+                }),
+            };
+            if let Err(err) = self.dc_emitter.send(ev) {
+                log::error!("Failed to enqueue data for retry: {}", err);
+            }
+        }
+    }
+
+    /// Updates the packet receive state (TTL map) for reliable packets.
+    fn update_packet_rx_state(&self, packet: &proto::DataPacket) {
+        if packet.sequence <= 0 || packet.participant_sid.is_empty() {
+            return;
+        };
+        let mut rx_state = self.packet_rx_state.lock();
+        if rx_state
+            .get(&packet.participant_sid)
+            .is_some_and(|&last_sequence| packet.sequence <= last_sequence)
+        {
+            log::warn!("Ignoring duplicate/out-of-order reliable data message");
+            return;
+        }
+        rx_state.set(&packet.participant_sid, Some(packet.sequence));
+    }
+
+    async fn on_signal_event(
+        self: &Arc<Self>,
+        event: proto::signal_response::Message,
+    ) -> EngineResult<()> {
         match event {
             proto::signal_response::Message::Answer(answer) => {
                 log::debug!("received publisher answer: {:?}", answer);
+
+                // Store mid_to_track_id mapping in single PC mode
+                if self.single_pc_mode && !answer.mid_to_track_id.is_empty() {
+                    let mut mapping = self.mid_to_track_id.lock();
+                    for (mid, track_id) in &answer.mid_to_track_id {
+                        mapping.insert(mid.clone(), track_id.clone());
+                    }
+                }
+
+                let max_message_size = std::cmp::min(
+                    parse_sdp_max_message_size(&answer.sdp).unwrap_or(DEFAULT_MAX_MESSAGE_SIZE),
+                    DEFAULT_MAX_MESSAGE_SIZE,
+                );
+
+                self.max_message_size.store(max_message_size, Ordering::Release);
+                log::debug!("negotiated data channel max message size: {} bytes", max_message_size);
+
                 let answer =
                     SessionDescription::parse(&answer.sdp, answer.r#type.parse().unwrap()).unwrap(); // Unwrap is ok, the server shouldn't give us an invalid sdp
                 self.publisher_pc.set_remote_description(answer).await?;
+
+                if self.single_pc_mode {
+                    self.process_remote_track_addition(&self.publisher_pc.peer_connection());
+                }
 
                 if self.fast_publish.load(Ordering::Acquire) {
                     if self.negotiation_queue.waiting_for_answer.swap(false, Ordering::AcqRel) {
@@ -676,17 +1369,31 @@ impl SessionInner {
                 }
             }
             proto::signal_response::Message::Offer(offer) => {
+                // In single PC mode, client always offers and server always answers,
+                // so we should never receive an offer from the server.
+                if self.single_pc_mode {
+                    log::warn!("received unexpected offer in single PC mode, ignoring");
+                    return Ok(());
+                }
+
+                // Dual PC mode: handle offer on subscriber PC
                 log::debug!("received subscriber offer: {:?}", offer);
-                let offer =
+                let offer_sdp =
                     SessionDescription::parse(&offer.sdp, offer.r#type.parse().unwrap()).unwrap();
-                let answer =
-                    self.subscriber_pc.create_anwser(offer, AnswerOptions::default()).await?;
+
+                let answer = self
+                    .subscriber_pc
+                    .as_ref()
+                    .unwrap()
+                    .create_anwser(offer_sdp, AnswerOptions::default())
+                    .await?;
 
                 self.signal_client
                     .send(proto::signal_request::Message::Answer(proto::SessionDescription {
                         r#type: "answer".to_string(),
                         sdp: answer.to_string(),
                         id: 0,
+                        mid_to_track_id: Default::default(),
                     }))
                     .await;
             }
@@ -703,8 +1410,11 @@ impl SessionInner {
 
                 if target == proto::SignalTarget::Publisher {
                     self.publisher_pc.add_ice_candidate(ice_candidate).await?;
+                } else if self.single_pc_mode {
+                    // In single PC mode, all ICE candidates go to publisher
+                    self.publisher_pc.add_ice_candidate(ice_candidate).await?;
                 } else {
-                    self.subscriber_pc.add_ice_candidate(ice_candidate).await?;
+                    self.subscriber_pc.as_ref().unwrap().add_ice_candidate(ice_candidate).await?;
                 }
             }
             proto::signal_response::Message::Leave(leave) => {
@@ -716,7 +1426,27 @@ impl SessionInner {
                     true,
                 );
             }
-            proto::signal_response::Message::Update(update) => {
+            proto::signal_response::Message::Update(mut update) => {
+                #[cfg(feature = "__lk-e2e-test")]
+                // injecting faulty behaviour during a signal disconnect to ensure we can mimic
+                // losing/missing participant disconnect events after a resume
+                // for test_resume_synthesizes_disconnect_for_participant_that_left
+                if self.drop_disconnected_updates.load(Ordering::Acquire) {
+                    update.participants.retain(|pi| {
+                        pi.state != proto::participant_info::State::Disconnected as i32
+                    });
+                }
+
+                let local_participant_identity = self.participant_info.identity.as_str().into();
+                if let Ok(event) = dt::remote::event_from_participant_update(
+                    &mut update,
+                    local_participant_identity,
+                ) {
+                    _ = self.emitter.send(SessionEvent::RemoteDataTrackInput(event.into()));
+                }
+                if let Some(seen) = self.resume_seen_identities.lock().as_mut() {
+                    seen.extend(update.participants.iter().map(|pi| pi.identity.clone().into()));
+                }
                 let _ = self
                     .emitter
                     .send(SessionEvent::ParticipantUpdate { updates: update.participants });
@@ -748,17 +1478,90 @@ impl SessionInner {
                 });
             }
             proto::signal_response::Message::RequestResponse(request_response) => {
+                if let Some(event) =
+                    dt::local::publish_result_from_request_response(&request_response)
+                {
+                    _ = self.emitter.send(SessionEvent::LocalDataTrackInput(event.into()));
+                    return Ok(());
+                }
                 let mut pending_requests = self.pending_requests.lock();
                 if let Some(tx) = pending_requests.remove(&request_response.request_id) {
                     let _ = tx.send(request_response);
                 }
             }
+            proto::signal_response::Message::PublishDataTrackResponse(publish_res) => {
+                let event: dt::local::SfuPublishResponse = publish_res.try_into()?;
+                _ = self.emitter.send(SessionEvent::LocalDataTrackInput(event.into()));
+            }
+            proto::signal_response::Message::UnpublishDataTrackResponse(unpublish_res) => {
+                let event: dt::local::SfuUnpublishResponse = unpublish_res.try_into()?;
+                _ = self.emitter.send(SessionEvent::LocalDataTrackInput(event.into()));
+            }
+            proto::signal_response::Message::DataTrackSubscriberHandles(subscriber_handles) => {
+                let event: dt::remote::SfuSubscriberHandles = subscriber_handles.try_into()?;
+                _ = self.emitter.send(SessionEvent::RemoteDataTrackInput(event.into()));
+            }
             proto::signal_response::Message::RefreshToken(ref token) => {
                 let url = self.signal_client.url();
                 let _ = self.emitter.send(SessionEvent::RefreshToken { url, token: token.clone() });
             }
+            proto::signal_response::Message::Mute(req) => {
+                let _ =
+                    self.emitter.send(SessionEvent::TrackMuted { sid: req.sid, muted: req.muted });
+            }
+            proto::signal_response::Message::MediaSectionsRequirement(req) => {
+                if self.single_pc_mode {
+                    self.handle_media_sections_requirement(req)?;
+                }
+            }
+            proto::signal_response::Message::SubscribedQualityUpdate(update) => {
+                log::debug!(
+                    "received subscribed quality update for track {}: {:?}",
+                    update.track_sid,
+                    update.subscribed_codecs
+                );
+                let _ = self.emitter.send(SessionEvent::SubscribedQualityUpdate { update });
+            }
+            proto::signal_response::Message::GetDataBlobResponse(response) => {
+                if let Some(tx) =
+                    self.pending_get_data_blob_requests.lock().remove(&response.request_id)
+                {
+                    let _ = tx.send(response);
+                }
+            }
+            proto::signal_response::Message::StoreDataBlobResponse(response) => {
+                if let Some(tx) =
+                    self.pending_store_data_blob_requests.lock().remove(&response.request_id)
+                {
+                    let _ = tx.send(response);
+                }
+            }
             _ => {}
         }
+
+        Ok(())
+    }
+
+    /// Handle MediaSectionsRequirement by adding recvonly transceivers to publisher PC.
+    /// This matches the JS SDK behavior: add transceivers and trigger negotiation.
+    fn handle_media_sections_requirement(
+        self: &Arc<Self>,
+        req: proto::MediaSectionsRequirement,
+    ) -> EngineResult<()> {
+        log::debug!(
+            "MediaSectionsRequirement: adding {} audio and {} video recvonly transceivers",
+            req.num_audios,
+            req.num_videos
+        );
+
+        RtcSession::add_recv_media_sections(
+            &self.publisher_pc.peer_connection(),
+            req.num_audios,
+            req.num_videos,
+        )?;
+
+        // Trigger renegotiation
+        self.publisher_negotiation_needed();
 
         Ok(())
     }
@@ -783,6 +1586,8 @@ impl SessionInner {
             RtcEvent::ConnectionChange { state, target } => {
                 log::debug!("connection change, {:?} {:?}", state, target);
 
+                self.pc_state_notify.notify_waiters();
+
                 if state == PeerConnectionState::Failed {
                     log::error!("{:?} pc state failed", target);
                     self.on_session_disconnected(
@@ -794,14 +1599,25 @@ impl SessionInner {
                 }
             }
             RtcEvent::DataChannel { data_channel, target } => {
-                log::debug!("received data channel: {:?} {:?}", data_channel, target);
-                if target == SignalTarget::Subscriber {
-                    if data_channel.label() == LOSSY_DC_LABEL {
-                        self.sub_lossy_dc.lock().replace(data_channel);
-                    } else if data_channel.label() == RELIABLE_DC_LABEL {
-                        self.sub_reliable_dc.lock().replace(data_channel);
-                    }
+                // In single PC mode, subscriber data channels come from publisher target
+                let is_subscriber_dc = if self.single_pc_mode {
+                    target == SignalTarget::Publisher
+                } else {
+                    target == SignalTarget::Subscriber
+                };
+                if !is_subscriber_dc {
+                    return Ok(());
                 }
+                let dc_ref = match data_channel.label().as_str() {
+                    LOSSY_DC_LABEL => &self.sub_lossy_dc,
+                    RELIABLE_DC_LABEL => &self.sub_reliable_dc,
+                    DATA_TRACK_DC_LABEL => {
+                        handle_remote_dt_packets(&data_channel, self.emitter.downgrade());
+                        &self.sub_data_track_dc
+                    }
+                    _ => return Ok(()),
+                };
+                dc_ref.lock().replace(data_channel);
             }
             RtcEvent::Offer { offer, target: _ } => {
                 // Send the publisher offer to the server
@@ -811,169 +1627,228 @@ impl SessionInner {
                         r#type: "offer".to_string(),
                         sdp: offer.to_string(),
                         id: 0,
+                        mid_to_track_id: Default::default(),
                     }))
                     .await;
             }
             RtcEvent::Track { mut streams, track, transceiver, target: _ } => {
                 if !streams.is_empty() {
-                    let _ = self.emitter.send(SessionEvent::MediaTrack {
-                        stream: streams.remove(0),
-                        track,
-                        transceiver,
-                    });
-                } else {
-                    log::warn!("Track event with no streams");
-                }
-            }
-            RtcEvent::Data { data, binary } => {
-                if !binary {
-                    Err(EngineError::Internal("text messages aren't supported".into()))?;
-                }
-
-                let data = proto::DataPacket::decode(&*data).unwrap();
-                if let Some(packet) = data.value.as_ref() {
-                    match packet {
-                        proto::data_packet::Value::User(user) => {
-                            let participant_sid = user
-                                .participant_sid
-                                .is_empty()
-                                .not()
-                                .then_some(user.participant_sid.clone());
-
-                            let participant_identity = if !data.participant_identity.is_empty() {
-                                Some(data.participant_identity.clone())
-                            } else if !user.participant_identity.is_empty() {
-                                Some(user.participant_identity.clone())
-                            } else {
-                                None
-                            };
-
-                            let _ = self.emitter.send(SessionEvent::Data {
-                                kind: data.kind().into(),
-                                participant_sid: participant_sid.map(|s| s.try_into().unwrap()),
-                                participant_identity: participant_identity
-                                    .map(|s| s.try_into().unwrap()),
-                                payload: user.payload.clone(),
-                                topic: user.topic.clone(),
-                            });
-                        }
-                        proto::data_packet::Value::SipDtmf(dtmf) => {
-                            let participant_identity = data
-                                .participant_identity
-                                .is_empty()
-                                .not()
-                                .then_some(data.participant_identity.clone());
-                            let digit = dtmf.digit.is_empty().not().then_some(dtmf.digit.clone());
-
-                            let _ = self.emitter.send(SessionEvent::SipDTMF {
-                                participant_identity: participant_identity
-                                    .map(|s| s.try_into().unwrap()),
-                                digit: digit.map(|s| s.try_into().unwrap()),
-                                code: dtmf.code,
-                            });
-                        }
-                        proto::data_packet::Value::Speaker(_) => {}
-                        proto::data_packet::Value::Transcription(transcription) => {
-                            let track_sid = transcription.track_id.clone();
-                            // let segments = transcription.segments.clone();
-                            let segments = transcription
-                                .segments
-                                .iter()
-                                .map(|s| TranscriptionSegment {
-                                    id: s.id.clone(),
-                                    start_time: s.start_time,
-                                    end_time: s.end_time,
-                                    text: s.text.clone(),
-                                    language: s.language.clone(),
-                                    r#final: s.r#final,
-                                })
-                                .collect();
-                            let participant_identity: ParticipantIdentity =
-                                transcription.transcribed_participant_identity.clone().into();
-                            let _ = self.emitter.send(SessionEvent::Transcription {
-                                participant_identity,
-                                track_sid,
-                                segments,
-                            });
-                        }
-                        proto::data_packet::Value::RpcRequest(rpc_request) => {
-                            let caller_identity = data
-                                .participant_identity
-                                .is_empty()
-                                .not()
-                                .then_some(data.participant_identity.clone())
-                                .map(|s| s.try_into().unwrap());
-                            let _ = self.emitter.send(SessionEvent::RpcRequest {
-                                caller_identity,
-                                request_id: rpc_request.id.clone(),
-                                method: rpc_request.method.clone(),
-                                payload: rpc_request.payload.clone(),
-                                response_timeout: Duration::from_millis(
-                                    rpc_request.response_timeout_ms as u64,
-                                ),
-                                version: rpc_request.version,
-                            });
-                        }
-                        proto::data_packet::Value::RpcResponse(rpc_response) => {
-                            let _ = self.emitter.send(SessionEvent::RpcResponse {
-                                request_id: rpc_response.request_id.clone(),
-                                payload: rpc_response.value.as_ref().and_then(|v| match v {
-                                    proto::rpc_response::Value::Payload(payload) => {
-                                        Some(payload.clone())
-                                    }
-                                    _ => None,
-                                }),
-                                error: rpc_response.value.as_ref().and_then(|v| match v {
-                                    proto::rpc_response::Value::Error(error) => Some(error.clone()),
-                                    _ => None,
-                                }),
-                            });
-                        }
-                        proto::data_packet::Value::RpcAck(rpc_ack) => {
-                            let _ = self.emitter.send(SessionEvent::RpcAck {
-                                request_id: rpc_ack.request_id.clone(),
-                            });
-                        }
-                        proto::data_packet::Value::ChatMessage(message) => {
-                            let _ = self.emitter.send(SessionEvent::ChatMessage {
-                                participant_identity: ParticipantIdentity(
-                                    data.participant_identity,
-                                ),
-                                message: ChatMessage::from(message.clone()),
-                            });
-                        }
-                        proto::data_packet::Value::StreamHeader(message) => {
-                            let _ = self.emitter.send(SessionEvent::DataStreamHeader {
-                                header: message.clone(),
-                                participant_identity: data.participant_identity.clone(),
-                            });
-                        }
-                        proto::data_packet::Value::StreamChunk(message) => {
-                            let _ = self.emitter.send(SessionEvent::DataStreamChunk {
-                                chunk: message.clone(),
-                                participant_identity: data.participant_identity.clone(),
-                            });
-                        }
-                        proto::data_packet::Value::StreamTrailer(message) => {
-                            let _ = self.emitter.send(SessionEvent::DataStreamTrailer {
-                                trailer: message.clone(),
-                                participant_identity: data.participant_identity.clone(),
-                            });
-                        }
-                        _ => {}
+                    let stream = streams.remove(0);
+                    let mid = transceiver.mid().unwrap_or_default();
+                    let already_dispatched = !mid.is_empty()
+                        && !self.dispatched_streams.lock().insert((mid, stream.id()));
+                    if !already_dispatched {
+                        let _ = self.emitter.send(SessionEvent::MediaTrack {
+                            stream,
+                            track,
+                            transceiver,
+                        });
                     }
                 }
             }
+            RtcEvent::Data { data, binary, kind } => {
+                if !binary {
+                    Err(EngineError::Internal("text messages aren't supported".into()))?;
+                }
+                let mut packet = proto::DataPacket::decode(&*data).map_err(|err| {
+                    EngineError::Internal(format!("failed to decode data packet: {}", err).into())
+                })?;
+                if kind == DataPacketKind::Reliable {
+                    self.update_packet_rx_state(&packet);
+                }
+                if let Some(detail) = packet.value.take() {
+                    let participant_sid: Option<ParticipantSid> =
+                        packet.participant_sid.try_into().ok();
+                    let participant_identity: Option<ParticipantIdentity> =
+                        packet.participant_identity.try_into().ok();
+                    self.emit_incoming_packet(
+                        kind,
+                        participant_sid,
+                        participant_identity,
+                        detail,
+                        proto::encryption::Type::None,
+                    );
+                }
+            }
             RtcEvent::DataChannelBufferedAmountChange { sent, amount: _, kind } => {
-                if let Err(err) =
-                    self.dc_emitter.send(DataChannelEvent::BufferedAmountChange(sent, kind))
-                {
+                let ev = DataChannelEvent {
+                    kind,
+                    detail: DataChannelEventDetail::BufferedAmountChange(sent),
+                };
+                if let Err(err) = self.dc_emitter.send(ev) {
                     log::error!("failed to send dc_event buffer_amount_change: {:?}", err);
                 }
             }
         }
 
         Ok(())
+    }
+
+    fn emit_incoming_packet(
+        &self,
+        kind: DataPacketKind,
+        participant_sid: Option<ParticipantSid>,
+        participant_identity: Option<ParticipantIdentity>,
+        value: proto::data_packet::Value,
+        encryption_type: proto::encryption::Type,
+    ) {
+        let send_result = match value {
+            proto::data_packet::Value::User(user) => {
+                // Participant SID and identity used to be defined on user packet, but
+                // they have been moved to the packet root. For backwards compatibility,
+                // we take the user packet's values if the top-level fields are not set.
+                let participant_sid =
+                    participant_sid.or_else(|| user.participant_sid.try_into().ok());
+                let participant_identity =
+                    participant_identity.or_else(|| user.participant_identity.try_into().ok());
+                self.emitter.send(SessionEvent::Data {
+                    kind,
+                    participant_sid,
+                    participant_identity,
+                    payload: user.payload,
+                    topic: user.topic,
+                    encryption_type,
+                })
+            }
+            proto::data_packet::Value::SipDtmf(dtmf) => self.emitter.send(SessionEvent::SipDTMF {
+                participant_identity,
+                digit: (!dtmf.digit.is_empty()).then_some(dtmf.digit),
+                code: dtmf.code,
+            }),
+            proto::data_packet::Value::Transcription(transcription) => {
+                let segments = transcription
+                    .segments
+                    .into_iter()
+                    .map(|s| TranscriptionSegment {
+                        id: s.id,
+                        start_time: s.start_time,
+                        end_time: s.end_time,
+                        text: s.text,
+                        language: s.language,
+                        r#final: s.r#final,
+                    })
+                    .collect();
+                let participant_identity = transcription.transcribed_participant_identity.into();
+
+                self.emitter.send(SessionEvent::Transcription {
+                    participant_identity,
+                    track_sid: transcription.track_id,
+                    segments,
+                })
+            }
+            proto::data_packet::Value::RpcRequest(rpc_request) => {
+                let caller_identity = participant_identity;
+                self.emitter.send(SessionEvent::RpcRequest {
+                    caller_identity,
+                    request_id: rpc_request.id.clone(),
+                    method: rpc_request.method,
+                    payload: rpc_request.payload,
+                    response_timeout: Duration::from_millis(rpc_request.response_timeout_ms as u64),
+                    version: rpc_request.version,
+                })
+            }
+            proto::data_packet::Value::RpcResponse(rpc_response) => {
+                let (payload, error) = match rpc_response.value {
+                    None => (None, None),
+                    Some(proto::rpc_response::Value::Payload(payload)) => (Some(payload), None),
+                    Some(proto::rpc_response::Value::Error(err)) => (None, Some(err)),
+                    Some(proto::rpc_response::Value::CompressedPayload(_)) => (None, None),
+                };
+                self.emitter.send(SessionEvent::RpcResponse {
+                    request_id: rpc_response.request_id,
+                    payload,
+                    error,
+                })
+            }
+            proto::data_packet::Value::RpcAck(rpc_ack) => {
+                self.emitter.send(SessionEvent::RpcAck { request_id: rpc_ack.request_id })
+            }
+            proto::data_packet::Value::ChatMessage(message) => {
+                self.emitter.send(SessionEvent::ChatMessage {
+                    participant_identity: participant_identity
+                        .unwrap_or(ParticipantIdentity("".into())),
+                    message: ChatMessage::from(message),
+                })
+            }
+            proto::data_packet::Value::StreamHeader(header) => {
+                let participant_identity =
+                    participant_identity.map_or("".into(), |identity| identity.0);
+                self.emitter.send(SessionEvent::DataStreamHeader {
+                    header,
+                    participant_identity,
+                    encryption_type,
+                })
+            }
+            proto::data_packet::Value::StreamChunk(chunk) => {
+                let participant_identity =
+                    participant_identity.map_or("".into(), |identity| identity.0);
+                self.emitter.send(SessionEvent::DataStreamChunk {
+                    chunk,
+                    participant_identity,
+                    encryption_type,
+                })
+            }
+            proto::data_packet::Value::StreamTrailer(trailer) => {
+                let participant_identity =
+                    participant_identity.map_or("".into(), |identity| identity.0);
+                self.emitter.send(SessionEvent::DataStreamTrailer { trailer, participant_identity })
+            }
+            proto::data_packet::Value::EncryptedPacket(encrypted_packet) => {
+                // Handle encrypted data packets
+                if let Some(e2ee_manager) = &self.e2ee_manager {
+                    let encryption_type = encrypted_packet.encryption_type();
+                    let participant_identity_str =
+                        participant_identity.as_ref().map(|p| p.0.as_str()).unwrap_or("");
+
+                    match e2ee_manager.decrypt_data(
+                        encrypted_packet.encrypted_value,
+                        encrypted_packet.iv,
+                        encrypted_packet.key_index,
+                        participant_identity_str,
+                    ) {
+                        Some(decrypted_payload) => {
+                            // Parse the decrypted payload as EncryptedPacketPayload
+                            match proto::EncryptedPacketPayload::decode(&*decrypted_payload) {
+                                Ok(encrypted_payload) => {
+                                    if let Some(decrypted_value) = encrypted_payload.value {
+                                        // Recursively call emit_incoming_packet with the decrypted value
+                                        self.emit_incoming_packet(
+                                            kind,
+                                            participant_sid,
+                                            participant_identity,
+                                            convert_encrypted_to_data_packet_value(decrypted_value),
+                                            encryption_type,
+                                        );
+                                        Ok(())
+                                    } else {
+                                        log::warn!("Failed to decrypt encrypted payload");
+                                        Ok(())
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("Failed to decode decrypted payload: {}", e);
+                                    Ok(())
+                                }
+                            }
+                        }
+                        None => {
+                            log::warn!(
+                                "Failed to decrypt data packet from {}",
+                                participant_identity_str
+                            );
+                            Ok(())
+                        }
+                    }
+                } else {
+                    log::warn!("Received encrypted data packet but E2EE is not enabled");
+                    Ok(()) // Don't emit the event if E2EE is not available
+                }
+            }
+            _ => Ok(()),
+        };
+        if let Err(err) = send_result {
+            log::error!("failed to emit incoming data packet: {:?}", err);
+        }
     }
 
     async fn add_track(&self, req: proto::AddTrackRequest) -> EngineResult<proto::TrackInfo> {
@@ -1026,6 +1901,16 @@ impl SessionInner {
         options: TrackPublishOptions,
         encodings: Vec<RtpEncodingParameters>,
     ) -> EngineResult<RtpTransceiver> {
+        // If video track, derive "ultimate" bitrate from encodings and stash it for offer munging.
+        // Must be done before encodings is moved into RtpTransceiverInit.
+        if track.kind() == TrackKind::Video {
+            let ultimate_bps: Option<u64> = {
+                let sum: u64 = encodings.iter().filter_map(|e| e.max_bitrate).sum();
+                (sum > 0).then_some(sum)
+            };
+            self.publisher_pc.set_max_send_bitrate_bps(ultimate_bps).await;
+        }
+
         let init = RtpTransceiverInit {
             direction: RtpTransceiverDirection::SendOnly,
             stream_ids: Default::default(),
@@ -1036,6 +1921,8 @@ impl SessionInner {
             self.publisher_pc.peer_connection().add_transceiver(track.rtc_track(), init)?;
 
         if track.kind() == TrackKind::Video {
+            transceiver.sender().set_video_encoder_backend(options.video_encoder);
+
             let capabilities = LkRuntime::instance().pc_factory().get_rtp_sender_capabilities(
                 match track.kind() {
                     TrackKind::Video => MediaType::Video,
@@ -1081,6 +1968,11 @@ impl SessionInner {
         action: proto::leave_request::Action,
         retry_now: bool,
     ) {
+        // A terminal disconnect (e.g. room deleted) closes the publisher data channels
+        // from the remote side; flag it so that close isn't logged as unexpected
+        if action == proto::leave_request::Action::Disconnect {
+            self.disconnecting.store(true, Ordering::Release);
+        }
         let _ = self.emitter.send(SessionEvent::Close {
             source: source.to_owned(),
             reason,
@@ -1089,33 +1981,43 @@ impl SessionInner {
         });
     }
 
-    async fn close(&self) {
+    async fn close(&self, reason: DisconnectReason) {
         self.closed.store(true, Ordering::Release);
+        self.pc_state_notify.notify_waiters();
 
         self.signal_client
             .send(proto::signal_request::Message::Leave(proto::LeaveRequest {
                 action: proto::leave_request::Action::Disconnect.into(),
-                reason: DisconnectReason::ClientInitiated as i32,
+                reason: reason as i32,
                 ..Default::default()
             }))
             .await;
 
         self.signal_client.close().await;
         self.publisher_pc.close();
-        self.subscriber_pc.close();
+        if let Some(ref sub_pc) = self.subscriber_pc {
+            sub_pc.close();
+        }
     }
 
-    async fn simulate_scenario(&self, scenario: SimulateScenario) -> EngineResult<()> {
-        let simulate_leave = || {
-            self.on_signal_event(proto::signal_response::Message::Leave(proto::LeaveRequest {
-                action: proto::leave_request::Action::Reconnect.into(),
-                reason: DisconnectReason::ClientInitiated as i32,
-                ..Default::default()
-            }))
-        };
-
+    async fn simulate_scenario(self: &Arc<Self>, scenario: SimulateScenario) -> EngineResult<()> {
         match scenario {
             SimulateScenario::SignalReconnect => {
+                self.signal_client.close().await;
+            }
+            SimulateScenario::DisconnectSignalOnResume => {
+                // Tell the server to drop the signalling link during the next
+                // resume, then trigger a resume by closing the link locally. The
+                // server kills the resumed signal, so the resume fails and the
+                // engine escalates to a full reconnect. Mirrors client-sdk-js's
+                // `disconnect-signal-on-resume`.
+                self.signal_client
+                    .send(proto::signal_request::Message::Simulate(proto::SimulateScenario {
+                        scenario: Some(
+                            proto::simulate_scenario::Scenario::DisconnectSignalOnResume(true),
+                        ),
+                    }))
+                    .await;
                 self.signal_client.close().await;
             }
             SimulateScenario::Speaker => {
@@ -1157,7 +2059,12 @@ impl SessionInner {
                     }))
                     .await;
 
-                simulate_leave().await?
+                self.on_signal_event(proto::signal_response::Message::Leave(proto::LeaveRequest {
+                    action: proto::leave_request::Action::Reconnect.into(),
+                    reason: DisconnectReason::ClientInitiated as i32,
+                    ..Default::default()
+                }))
+                .await?
             }
             SimulateScenario::ForceTls => {
                 self.signal_client
@@ -1170,7 +2077,26 @@ impl SessionInner {
                     }))
                     .await;
 
-                simulate_leave().await?
+                self.on_signal_event(proto::signal_response::Message::Leave(proto::LeaveRequest {
+                    action: proto::leave_request::Action::Reconnect.into(),
+                    reason: DisconnectReason::ClientInitiated as i32,
+                    ..Default::default()
+                }))
+                .await?
+            }
+            SimulateScenario::FullReconnect => {
+                // Client-driven full reconnect, mirroring client-sdk-js's
+                // `full-reconnect` scenario: force the next reconnect to be a
+                // full reconnect and trigger it locally, rather than asking the
+                // server to echo a Leave. The server-side
+                // `LeaveRequestFullReconnect` simulation is not honoured by every
+                // server build, so relying on it makes this scenario flaky.
+                self.on_signal_event(proto::signal_response::Message::Leave(proto::LeaveRequest {
+                    action: proto::leave_request::Action::Reconnect.into(),
+                    reason: DisconnectReason::ClientInitiated as i32,
+                    ..Default::default()
+                }))
+                .await?
             }
         }
         Ok(())
@@ -1178,18 +2104,88 @@ impl SessionInner {
 
     async fn publish_data(
         self: &Arc<Self>,
-        data: proto::DataPacket,
+        mut packet: proto::DataPacket,
         kind: DataPacketKind,
+        is_raw_packet: bool,
     ) -> Result<(), EngineError> {
         self.ensure_publisher_connected(kind).await?;
 
-        let (tx, rx) = oneshot::channel();
-        if let Err(err) = self.dc_emitter.send(DataChannelEvent::PublishData(data, kind, tx)) {
+        // Populate local participant info fields
+        if !is_raw_packet {
+            packet.participant_identity = self.participant_info.identity.to_string();
+            packet.participant_sid = self.participant_info.sid.to_string();
+        }
+
+        let packet_value = packet.value.take();
+
+        // Handle encryption for all data packet types when DC encryption is enabled
+        if let (Some(e2ee_manager), Some(value)) = (&self.e2ee_manager, packet_value.clone()) {
+            if e2ee_manager.is_dc_encryption_enabled() {
+                // Create EncryptedPacketPayload from the original value if it's an encryptable type
+                let encrypted_payload_value = convert_data_packet_to_encrypted_value(value);
+
+                if let Some(encrypted_payload_value) = encrypted_payload_value {
+                    // Create EncryptedPacketPayload and encrypt it
+                    let encrypted_payload =
+                        proto::EncryptedPacketPayload { value: Some(encrypted_payload_value) };
+
+                    // Encode the payload and encrypt it
+                    let payload_bytes = encrypted_payload.encode_to_vec();
+
+                    let key_index = e2ee_manager
+                        .key_provider()
+                        .map_or(0, |kp| kp.get_latest_key_index() as u32);
+
+                    match e2ee_manager.encrypt_data(
+                        payload_bytes,
+                        &self.participant_info.identity,
+                        key_index,
+                    ) {
+                        Ok(encrypted_data) => {
+                            // Replace with EncryptedPacket variant
+                            packet.value = Some(proto::data_packet::Value::EncryptedPacket(
+                                proto::EncryptedPacket {
+                                    encrypted_value: encrypted_data.data,
+                                    iv: encrypted_data.iv,
+                                    key_index: encrypted_data.key_index,
+                                    encryption_type: e2ee_manager.encryption_type().into(),
+                                },
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(EngineError::Internal(
+                                format!("Failed to encrypt data packet: {}", e).into(),
+                            ));
+                        }
+                    }
+                } else {
+                    // Packet type shouldn't be encrypted, restore original
+                    packet.value = packet_value;
+                }
+            } else {
+                // DC encryption not enabled, restore original packet
+                packet.value = packet_value;
+            }
+        } else {
+            // No e2ee_manager or no packet value - restore original
+            packet.value = packet_value;
+        }
+
+        // Send through the queue with backpressure
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let ev = DataChannelEvent {
+            kind,
+            detail: DataChannelEventDetail::PublishPacket(PublishPacketRequest {
+                packet,
+                completion_tx,
+            }),
+        };
+        if let Err(err) = self.dc_emitter.send(ev) {
             return Err(EngineError::Internal(
-                format!("failed to push data into queue: {:?}", err).into(),
+                format!("Failed to enqueue publish packet request: {:?}", err).into(),
             ));
         };
-        rx.await.map_err(|e| {
+        completion_rx.await.map_err(|e| {
             EngineError::Internal(format!("failed to receive data from dc_task: {:?}", e).into())
         })?
     }
@@ -1197,19 +2193,36 @@ impl SessionInner {
     /// This reconnection if more seemless compared to the full reconnection implemented in
     /// ['RTCEngine']
     async fn restart(&self) -> EngineResult<proto::ReconnectResponse> {
+        // Start accumulating before the signal client reconnects: once
+        // `restart` returns, the resumed stream immediately delivers events
+        // (including the post-resume participant snapshot) on a concurrent task.
+        *self.resume_seen_identities.lock() = Some(HashSet::new());
         let reconnect_response = self.signal_client.restart().await?;
         log::debug!("received reconnect response: {:?}", reconnect_response);
 
         let rtc_config =
             make_rtc_config_reconnect(reconnect_response.clone(), self.options.rtc_config.clone());
         self.publisher_pc.peer_connection().set_configuration(rtc_config.clone())?;
-        self.subscriber_pc.peer_connection().set_configuration(rtc_config)?;
+        if let Some(ref sub_pc) = self.subscriber_pc {
+            sub_pc.peer_connection().set_configuration(rtc_config)?;
+        }
+
+        let ev = DataChannelEvent {
+            kind: DataPacketKind::Reliable,
+            detail: DataChannelEventDetail::RetryFrom(reconnect_response.last_message_seq),
+        };
+        if let Err(err) = self.dc_emitter.send(ev) {
+            log::error!("Failed to request reliable retry: {:?}", err);
+        }
 
         Ok(reconnect_response)
     }
 
     async fn restart_publisher(&self) -> EngineResult<()> {
-        if self.has_published.load(Ordering::Acquire) {
+        // In single-PC mode the publisher is the only transport, so always restart its ICE
+        // even if the user hasn't explicitly published a track yet. Otherwise only restart
+        // when we have something to keep alive on the publisher side.
+        if self.single_pc_mode || self.has_published.load(Ordering::Acquire) {
             self.publisher_pc
                 .create_and_send_offer(OfferOptions { ice_restart: true, ..Default::default() })
                 .await?;
@@ -1219,15 +2232,40 @@ impl SessionInner {
 
     /// Timeout after ['MAX_ICE_CONNECT_TIMEOUT']
     async fn wait_pc_connection(&self) -> EngineResult<()> {
+        self.wait_pc_connection_with_delay(Duration::ZERO).await
+    }
+
+    /// Like [`Self::wait_pc_connection`] but sleeps `settle_delay` before polling.
+    async fn wait_pc_connection_with_delay(&self, settle_delay: Duration) -> EngineResult<()> {
         let wait_connected = async move {
-            while !self.subscriber_pc.is_connected()
-                || (self.has_published.load(Ordering::Acquire) && !self.publisher_pc.is_connected())
-            {
+            if !settle_delay.is_zero() {
+                livekit_runtime::sleep(settle_delay).await;
+            }
+
+            loop {
+                let notified = self.pc_state_notify.notified();
+
                 if self.closed.load(Ordering::Acquire) {
                     return Err(EngineError::Connection("closed".into()));
                 }
 
-                livekit_runtime::sleep(Duration::from_millis(50)).await;
+                let publisher_connected = self.publisher_pc.is_connected();
+                let subscriber_connected = if self.single_pc_mode || !self.subscriber_primary {
+                    true // No subscriber in single PC mode or if PC is publisher primary
+                } else {
+                    self.subscriber_pc.as_ref().map(|pc| pc.is_connected()).unwrap_or(true)
+                };
+
+                // In single-PC mode the publisher is the only transport, so it must always
+                // be connected — independent of whether the user has published any tracks.
+                let need_publisher =
+                    self.single_pc_mode || self.has_published.load(Ordering::Acquire);
+
+                if subscriber_connected && (!need_publisher || publisher_connected) {
+                    break;
+                }
+
+                let _ = tokio::time::timeout(Duration::from_millis(50), notified).await;
             }
 
             Ok(())
@@ -1355,11 +2393,29 @@ impl SessionInner {
         }
     }
 
-    /// Ensure the Publisher PC is connected, if not, start the negotiation
-    /// This is required when sending data to the server
+    /// Ensure the publisher peer connection and data channel for the specified packet
+    /// type are connected. If not, start the negotiation.
+    ///
+    /// This is required when sending data to the server.
+    ///
     async fn ensure_publisher_connected(
         self: &Arc<Self>,
         kind: DataPacketKind,
+    ) -> EngineResult<()> {
+        let required_dc = self.data_channel(SignalTarget::Publisher, kind).unwrap();
+        self.ensure_publisher_connected_with_dc(required_dc).await?;
+        Ok(())
+    }
+
+    /// Ensure the required data channel for publishing data track frames is open.
+    async fn ensure_data_track_publisher_connected(self: &Arc<Self>) -> EngineResult<()> {
+        self.ensure_publisher_connected_with_dc(self.data_track_dc.clone()).await?;
+        Ok(())
+    }
+
+    async fn ensure_publisher_connected_with_dc(
+        self: &Arc<Self>,
+        required_dc: DataChannel,
     ) -> EngineResult<()> {
         if !self.has_published.load(Ordering::Acquire) {
             // The publisher has never been connected, start the negotiation
@@ -1367,14 +2423,14 @@ impl SessionInner {
             self.publisher_negotiation_needed();
         }
 
-        let dc = self.data_channel(SignalTarget::Publisher, kind).unwrap();
-        if dc.state() == DataChannelState::Open {
+        if required_dc.state() == DataChannelState::Open {
             return Ok(());
         }
 
         // Wait until the PeerConnection is connected
         let wait_connected = async {
-            while !self.publisher_pc.is_connected() || dc.state() != DataChannelState::Open {
+            while !self.publisher_pc.is_connected() || required_dc.state() != DataChannelState::Open
+            {
                 if self.closed.load(Ordering::Acquire) {
                     return Err(EngineError::Connection("closed".into()));
                 }
@@ -1385,14 +2441,16 @@ impl SessionInner {
             Ok(())
         };
 
-        tokio::select! {
+        let result = tokio::select! {
             res = wait_connected => res,
             _ = sleep(ICE_CONNECT_TIMEOUT) => {
                 let err = EngineError::Connection("could not establish publisher connection: timeout".into());
                 log::error!("{}", err);
                 Err(err)
             }
-        }
+        };
+
+        result
     }
 
     fn data_channel(&self, target: SignalTarget, kind: DataPacketKind) -> Option<DataChannel> {
@@ -1413,11 +2471,81 @@ impl SessionInner {
         }
     }
 
+    fn data_channel_receive_states(self: &Arc<Self>) -> Vec<proto::DataChannelReceiveState> {
+        let mut state = self.packet_rx_state.lock();
+        state
+            .iter()
+            .map(|(publisher_sid, last_seq)| proto::DataChannelReceiveState {
+                publisher_sid: publisher_sid.to_string(),
+                last_seq: *last_seq,
+            })
+            .collect()
+    }
+
     async fn get_response(&self, request_id: u32) -> proto::RequestResponse {
         let (tx, rx) = oneshot::channel();
         self.pending_requests.lock().insert(request_id, tx);
+        let _guard = PendingResponseGuard::new(&self.pending_requests, request_id);
         rx.await.unwrap()
     }
+
+    async fn get_data_blob_response(&self, request_id: u32) -> proto::GetDataBlobResponse {
+        let (tx, rx) = oneshot::channel();
+        self.pending_get_data_blob_requests.lock().insert(request_id, tx);
+        let _guard = PendingResponseGuard::new(&self.pending_get_data_blob_requests, request_id);
+        rx.await.expect("data blob response sender dropped")
+    }
+
+    async fn store_data_blob_response(&self, request_id: u32) -> proto::StoreDataBlobResponse {
+        let (tx, rx) = oneshot::channel();
+        self.pending_store_data_blob_requests.lock().insert(request_id, tx);
+        let _guard = PendingResponseGuard::new(&self.pending_store_data_blob_requests, request_id);
+        rx.await.expect("store data blob response sender dropped")
+    }
+}
+
+/// Parses the `a=max-message-size` attribute (RFC 8841) from an SDP, returning
+/// the value in bytes. Returns `None` when the attribute is absent or invalid.
+fn parse_sdp_max_message_size(sdp: &str) -> Option<u64> {
+    sdp.lines()
+        .find_map(|line| line.trim().strip_prefix("a=max-message-size:"))
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+/// Removes a pending response registration when dropped.
+///
+/// Installed alongside a registration so that abandoning the wait (e.g. a timeout or a
+/// losing [`tokio::select!`] branch) cannot leave a stale entry behind. Dropping after the
+/// response has already been delivered is a no-op since the entry is removed on delivery.
+struct PendingResponseGuard<'a, T> {
+    map: &'a Mutex<HashMap<u32, oneshot::Sender<T>>>,
+    request_id: u32,
+}
+
+impl<'a, T> PendingResponseGuard<'a, T> {
+    fn new(map: &'a Mutex<HashMap<u32, oneshot::Sender<T>>>, request_id: u32) -> Self {
+        Self { map, request_id }
+    }
+}
+
+impl<T> Drop for PendingResponseGuard<'_, T> {
+    fn drop(&mut self) {
+        self.map.lock().remove(&self.request_id);
+    }
+}
+
+/// Emit incoming data track packets as session events.
+pub fn handle_remote_dt_packets(dc: &DataChannel, emitter: WeakUnboundedSender<SessionEvent>) {
+    let on_message: libwebrtc::data_channel::OnMessage = Box::new(move |buffer: DataBuffer| {
+        if !buffer.binary {
+            log::error!("Received non-binary message");
+            return;
+        }
+        let packet: Bytes = buffer.data.to_vec().into(); // TODO: avoid clone if possible
+        let Some(emitter) = emitter.upgrade() else { return };
+        _ = emitter.send(SessionEvent::RemoteDataTrackInput(packet.into()));
+    });
+    dc.on_message(on_message.into());
 }
 
 macro_rules! make_rtc_config {
@@ -1446,3 +2574,47 @@ macro_rules! make_rtc_config {
 
 make_rtc_config!(make_rtc_config_join, proto::JoinResponse);
 make_rtc_config!(make_rtc_config_reconnect, proto::ReconnectResponse);
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_sdp_max_message_size, DEFAULT_MAX_MESSAGE_SIZE};
+
+    #[test]
+    fn parses_max_message_size_from_application_section() {
+        let sdp = "v=0\r\n\
+                   m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n\
+                   a=sctp-port:5000\r\n\
+                   a=max-message-size:262144\r\n";
+        assert_eq!(parse_sdp_max_message_size(sdp), Some(262144));
+    }
+
+    #[test]
+    fn parses_with_lf_only_and_surrounding_whitespace() {
+        let sdp = "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\n a=max-message-size: 65536 \n";
+        assert_eq!(parse_sdp_max_message_size(sdp), Some(65536));
+    }
+
+    #[test]
+    fn missing_attribute_returns_none_so_default_is_used() {
+        let sdp = "v=0\r\nm=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\na=sctp-port:5000\r\n";
+        assert_eq!(parse_sdp_max_message_size(sdp), None);
+        // Callers fall back to the default when the attribute is absent.
+        assert_eq!(
+            parse_sdp_max_message_size(sdp).unwrap_or(DEFAULT_MAX_MESSAGE_SIZE),
+            DEFAULT_MAX_MESSAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn zero_is_parsed_and_means_no_limit() {
+        // RFC 8841: a value of 0 indicates the peer can receive any message size.
+        // The send guard treats 0 as "no limit" and skips the check.
+        assert_eq!(parse_sdp_max_message_size("a=max-message-size:0\r\n"), Some(0));
+    }
+
+    #[test]
+    fn invalid_or_empty_value_returns_none() {
+        assert_eq!(parse_sdp_max_message_size("a=max-message-size:abc\r\n"), None);
+        assert_eq!(parse_sdp_max_message_size("a=max-message-size:\r\n"), None);
+    }
+}

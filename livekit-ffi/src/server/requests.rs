@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,14 +19,14 @@ use livekit::{
     prelude::*,
     register_audio_filter_plugin,
     webrtc::{native::apm, native::audio_resampler, prelude::*},
-    AudioFilterPlugin,
+    AudioFilterPlugin, SimulateScenario,
 };
 use parking_lot::Mutex;
 
 use super::{
-    audio_source, audio_stream, colorcvt, data_stream,
+    audio_source, audio_stream, colorcvt, data_stream, data_track,
     participant::FfiParticipant,
-    resampler,
+    platform_audio, resampler,
     room::{self, FfiPublication, FfiTrack},
     video_source, video_stream, FfiError, FfiResult, FfiServer,
 };
@@ -64,20 +64,68 @@ fn on_disconnect(
     server: &'static FfiServer,
     disconnect: proto::DisconnectRequest,
 ) -> FfiResult<proto::DisconnectResponse> {
-    let async_id = server.next_id();
+    let async_id = server.resolve_async_id(disconnect.request_async_id);
+    let reason = disconnect
+        .reason
+        .and_then(|r| proto::DisconnectReason::try_from(r).ok())
+        .map(DisconnectReason::from)
+        .unwrap_or(DisconnectReason::ClientInitiated);
+
+    let ffi_room = server.retrieve_handle::<room::FfiRoom>(disconnect.room_handle)?.clone();
+
     let handle = server.async_runtime.spawn(async move {
-        let ffi_room =
-            server.retrieve_handle::<room::FfiRoom>(disconnect.room_handle).unwrap().clone();
-
-        ffi_room.close(server).await;
-
-        let _ =
-            server.send_event(proto::ffi_event::Message::Disconnect(proto::DisconnectCallback {
-                async_id,
-            }));
+        ffi_room.close(server, reason).await;
+        let _ = server.send_event(proto::DisconnectCallback { async_id }.into());
     });
     server.watch_panic(handle);
     Ok(proto::DisconnectResponse { async_id })
+}
+
+/// Simulate a reconnection scenario for chaos / E2E testing.
+/// This is an async function; the FfiClient must wait for the SimulateScenarioCallback.
+fn on_simulate_scenario(
+    server: &'static FfiServer,
+    request: proto::SimulateScenarioRequest,
+) -> FfiResult<proto::SimulateScenarioResponse> {
+    let async_id = server.resolve_async_id(request.request_async_id);
+    let scenario_kind = proto::SimulateScenarioKind::try_from(request.scenario)
+        .map_err(|_| FfiError::InvalidRequest("unknown SimulateScenarioKind".into()))?;
+    let scenario = match scenario_kind {
+        proto::SimulateScenarioKind::SimulateSignalReconnect => SimulateScenario::SignalReconnect,
+        proto::SimulateScenarioKind::SimulateSpeaker => SimulateScenario::Speaker,
+        proto::SimulateScenarioKind::SimulateNodeFailure => SimulateScenario::NodeFailure,
+        proto::SimulateScenarioKind::SimulateServerLeave => SimulateScenario::ServerLeave,
+        proto::SimulateScenarioKind::SimulateMigration => SimulateScenario::Migration,
+        proto::SimulateScenarioKind::SimulateForceTcp => SimulateScenario::ForceTcp,
+        proto::SimulateScenarioKind::SimulateForceTls => SimulateScenario::ForceTls,
+        proto::SimulateScenarioKind::SimulateFullReconnect => SimulateScenario::FullReconnect,
+        proto::SimulateScenarioKind::SimulateDisconnectSignalOnResume => {
+            SimulateScenario::DisconnectSignalOnResume
+        }
+    };
+
+    let ffi_room = server.retrieve_handle::<room::FfiRoom>(request.room_handle)?.clone();
+
+    let handle = server.async_runtime.spawn(async move {
+        let error = match ffi_room.inner.room.simulate_scenario(scenario).await {
+            Ok(()) => None,
+            Err(err) => Some(err.to_string()),
+        };
+        let _ = server.send_event(proto::SimulateScenarioCallback { async_id, error }.into());
+    });
+    server.watch_panic(handle);
+    Ok(proto::SimulateScenarioResponse { async_id })
+}
+
+/// Mark the room event listener as ready so room event forwarding can begin.
+/// The FFI client should send this once it has installed its event listener.
+fn on_ready_for_room_event(
+    server: &'static FfiServer,
+    request: proto::ReadyForRoomEventRequest,
+) -> FfiResult<proto::ReadyForRoomEventResponse> {
+    let ffi_room = server.retrieve_handle::<room::FfiRoom>(request.room_handle)?.clone();
+    ffi_room.ready_for_room_event();
+    Ok(proto::ReadyForRoomEventResponse::default())
 }
 
 /// Publish a track to a room, and send a response to the FfiClient
@@ -182,6 +230,25 @@ fn on_update_remote_track_publication_dimension(
     let dimension = TrackDimension(request.width, request.height);
     publication.update_video_dimensions(dimension);
     Ok(proto::UpdateRemoteTrackPublicationDimensionResponse {})
+}
+
+fn on_set_remote_track_publication_quality(
+    server: &'static FfiServer,
+    request: proto::SetRemoteTrackPublicationQualityRequest,
+) -> FfiResult<proto::SetRemoteTrackPublicationQualityResponse> {
+    let ffi_publication =
+        server.retrieve_handle::<FfiPublication>(request.track_publication_handle)?;
+
+    let TrackPublication::Remote(publication) = &ffi_publication.publication else {
+        return Err(FfiError::InvalidRequest("publication is not a RemotePublication".into()));
+    };
+    let quality = match request.quality() {
+        proto::VideoQuality::Low => livekit::track::VideoQuality::Low,
+        proto::VideoQuality::Medium => livekit::track::VideoQuality::Medium,
+        proto::VideoQuality::High => livekit::track::VideoQuality::High,
+    };
+    publication.set_video_quality(quality);
+    Ok(proto::SetRemoteTrackPublicationQualityResponse {})
 }
 
 fn on_set_local_metadata(
@@ -387,26 +454,28 @@ fn on_get_stats(
     get_stats: proto::GetStatsRequest,
 ) -> FfiResult<proto::GetStatsResponse> {
     let ffi_track = server.retrieve_handle::<FfiTrack>(get_stats.track_handle)?.clone();
-    let async_id = server.next_id();
+    let async_id = server.resolve_async_id(get_stats.request_async_id);
     let handle = server.async_runtime.spawn(async move {
         match ffi_track.track.get_stats().await {
             Ok(stats) => {
-                let _ = server.send_event(proto::ffi_event::Message::GetStats(
+                let _ = server.send_event(
                     proto::GetStatsCallback {
                         async_id,
                         error: None,
                         stats: stats.into_iter().map(Into::into).collect(),
-                    },
-                ));
+                    }
+                    .into(),
+                );
             }
             Err(err) => {
-                let _ = server.send_event(proto::ffi_event::Message::GetStats(
+                let _ = server.send_event(
                     proto::GetStatsCallback {
                         async_id,
                         error: Some(err.to_string()),
                         stats: Vec::default(),
-                    },
-                ));
+                    }
+                    .into(),
+                );
             }
         }
     });
@@ -708,12 +777,12 @@ fn on_get_session_stats(
     get_session_stats: proto::GetSessionStatsRequest,
 ) -> FfiResult<proto::GetSessionStatsResponse> {
     let ffi_room = server.retrieve_handle::<room::FfiRoom>(get_session_stats.room_handle)?.clone();
-    let async_id = server.next_id();
+    let async_id = server.resolve_async_id(get_session_stats.request_async_id);
 
     let handle = server.async_runtime.spawn(async move {
         match ffi_room.inner.room.get_stats().await {
             Ok(stats) => {
-                let _ = server.send_event(proto::ffi_event::Message::GetSessionStats(
+                let _ = server.send_event(
                     proto::GetSessionStatsCallback {
                         async_id,
                         message: Some(proto::get_session_stats_callback::Message::Result(
@@ -730,18 +799,20 @@ fn on_get_session_stats(
                                     .collect(),
                             },
                         )),
-                    },
-                ));
+                    }
+                    .into(),
+                );
             }
             Err(err) => {
-                let _ = server.send_event(proto::ffi_event::Message::GetSessionStats(
+                let _ = server.send_event(
                     proto::GetSessionStatsCallback {
                         async_id,
                         message: Some(proto::get_session_stats_callback::Message::Error(
                             err.to_string(),
                         )),
-                    },
-                ));
+                    }
+                    .into(),
+                );
             }
         }
     });
@@ -968,7 +1039,7 @@ fn on_perform_rpc(
 }
 
 fn on_load_audio_filter_plugin(
-    _server: &'static FfiServer,
+    server: &'static FfiServer,
     request: proto::LoadAudioFilterPluginRequest,
 ) -> FfiResult<proto::LoadAudioFilterPluginResponse> {
     let deps: Vec<_> = request.dependencies.iter().map(|d| d).collect();
@@ -979,7 +1050,28 @@ fn on_load_audio_filter_plugin(
         }
     };
 
-    register_audio_filter_plugin(request.module_id, plugin);
+    register_audio_filter_plugin(request.module_id, plugin.clone());
+
+    // `on_load` is normally called for every registered plugin when a room
+    // connects, but that is a one-time snapshot: a plugin registered *after*
+    // a room has already connected would otherwise never be initialized for
+    // it (its `create` would then fail because the connection was never
+    // authenticated). Run `on_load` now for any already-connected rooms so
+    // registration order doesn't matter. `on_load` is expected to be
+    // idempotent (it is already called once per connected room), so a repeat
+    // registration re-running it here is harmless.
+    for room in server.list_rooms() {
+        let plugin = plugin.clone();
+        let url = room.inner.url();
+        let token = room.inner.room.token();
+        // Spawn (don't block the request): a plugin's `on_load` may perform
+        // network I/O, and this must not stall the FFI request thread.
+        server.async_runtime.spawn_blocking(move || {
+            if let Err(e) = plugin.on_load(&url, &token) {
+                log::error!("audio filter on_load failed for an already-connected room: {e}");
+            }
+        });
+    }
 
     Ok(proto::LoadAudioFilterPluginResponse { error: None })
 }
@@ -1100,6 +1192,15 @@ fn on_send_file(
     ffi_participant.send_file(server, request)
 }
 
+fn on_send_bytes(
+    server: &'static FfiServer,
+    request: proto::StreamSendBytesRequest,
+) -> FfiResult<proto::StreamSendBytesResponse> {
+    let ffi_participant =
+        server.retrieve_handle::<FfiParticipant>(request.local_participant_handle)?.clone();
+    ffi_participant.send_bytes(server, request)
+}
+
 fn on_send_text(
     server: &'static FfiServer,
     request: proto::StreamSendTextRequest,
@@ -1161,6 +1262,95 @@ fn on_text_stream_close(
     writer.close(server, request)
 }
 
+fn on_publish_data_track(
+    server: &'static FfiServer,
+    request: proto::PublishDataTrackRequest,
+) -> FfiResult<proto::PublishDataTrackResponse> {
+    let ffi_participant =
+        server.retrieve_handle::<FfiParticipant>(request.local_participant_handle)?.clone();
+    ffi_participant.publish_data_track(server, request)
+}
+
+fn on_define_schema(
+    server: &'static FfiServer,
+    request: proto::DefineSchemaRequest,
+) -> FfiResult<proto::DefineSchemaResponse> {
+    let ffi_participant =
+        server.retrieve_handle::<FfiParticipant>(request.local_participant_handle)?.clone();
+    ffi_participant.define_schema(server, request)
+}
+
+fn on_get_schema(
+    server: &'static FfiServer,
+    request: proto::GetSchemaRequest,
+) -> FfiResult<proto::GetSchemaResponse> {
+    let ffi_participant =
+        server.retrieve_handle::<FfiParticipant>(request.local_participant_handle)?.clone();
+    ffi_participant.get_schema(server, request)
+}
+
+fn on_local_data_track_is_published(
+    server: &'static FfiServer,
+    request: proto::LocalDataTrackIsPublishedRequest,
+) -> FfiResult<proto::LocalDataTrackIsPublishedResponse> {
+    let track =
+        server.retrieve_handle::<data_track::FfiLocalDataTrack>(request.track_handle)?.clone();
+    track.is_published(server, request)
+}
+
+fn on_local_data_track_unpublish(
+    server: &'static FfiServer,
+    request: proto::LocalDataTrackUnpublishRequest,
+) -> FfiResult<proto::LocalDataTrackUnpublishResponse> {
+    let track =
+        server.retrieve_handle::<data_track::FfiLocalDataTrack>(request.track_handle)?.clone();
+    track.unpublish(server, request)
+}
+
+fn on_local_data_track_try_push(
+    server: &'static FfiServer,
+    request: proto::LocalDataTrackTryPushRequest,
+) -> FfiResult<proto::LocalDataTrackTryPushResponse> {
+    let track =
+        server.retrieve_handle::<data_track::FfiLocalDataTrack>(request.track_handle)?.clone();
+    track.try_push(server, request)
+}
+
+fn on_subscribe_local_data_track(
+    server: &'static FfiServer,
+    request: proto::SubscribeDataTrackRequest,
+) -> FfiResult<proto::SubscribeDataTrackResponse> {
+    let track =
+        server.retrieve_handle::<data_track::FfiRemoteDataTrack>(request.track_handle)?.clone();
+    track.subscribe(server, request)
+}
+
+fn on_remote_data_track_is_published(
+    server: &'static FfiServer,
+    request: proto::RemoteDataTrackIsPublishedRequest,
+) -> FfiResult<proto::RemoteDataTrackIsPublishedResponse> {
+    let track =
+        server.retrieve_handle::<data_track::FfiRemoteDataTrack>(request.track_handle)?.clone();
+    track.is_published(server, request)
+}
+
+fn on_remote_data_track_set_pipeline_options(
+    server: &'static FfiServer,
+    request: proto::RemoteDataTrackSetPipelineOptionsRequest,
+) -> FfiResult<proto::RemoteDataTrackSetPipelineOptionsResponse> {
+    let track =
+        server.retrieve_handle::<data_track::FfiRemoteDataTrack>(request.track_handle)?.clone();
+    track.set_pipeline_options(server, request)
+}
+
+fn on_data_track_stream_read(
+    server: &'static FfiServer,
+    request: proto::DataTrackStreamReadRequest,
+) -> FfiResult<proto::DataTrackStreamReadResponse> {
+    let stream = server.retrieve_handle::<data_track::FfiDataTrackStream>(request.stream_handle)?;
+    Ok(stream.read(request))
+}
+
 #[allow(clippy::field_reassign_with_default)] // Avoid uggly format
 pub fn handle_request(
     server: &'static FfiServer,
@@ -1171,249 +1361,126 @@ pub fn handle_request(
 
     let mut res = proto::FfiResponse::default();
 
+    use proto::ffi_request::Message as Request;
     res.message = Some(match request {
-        proto::ffi_request::Message::Dispose(dispose) => {
-            proto::ffi_response::Message::Dispose(on_dispose(server, dispose)?)
+        Request::Dispose(req) => on_dispose(server, req)?.into(),
+        Request::Connect(req) => on_connect(server, req)?.into(),
+        Request::Disconnect(req) => on_disconnect(server, req)?.into(),
+        Request::SimulateScenario(req) => on_simulate_scenario(server, req)?.into(),
+        Request::ReadyForRoomEvent(req) => on_ready_for_room_event(server, req)?.into(),
+        Request::PublishTrack(req) => on_publish_track(server, req)?.into(),
+        Request::UnpublishTrack(req) => on_unpublish_track(server, req)?.into(),
+        Request::PublishData(req) => on_publish_data(server, req)?.into(),
+        Request::PublishTranscription(req) => on_publish_transcription(server, req)?.into(),
+        Request::PublishSipDtmf(req) => on_publish_sip_dtmf(server, req)?.into(),
+        Request::SetSubscribed(req) => on_set_subscribed(server, req)?.into(),
+        Request::SetLocalMetadata(req) => on_set_local_metadata(server, req)?.into(),
+        Request::SetLocalName(req) => on_set_local_name(server, req)?.into(),
+        Request::SetLocalAttributes(req) => on_set_local_attributes(server, req)?.into(),
+        Request::SendChatMessage(req) => on_send_chat_message(server, req)?.into(),
+        Request::EditChatMessage(req) => on_edit_chat_message(server, req)?.into(),
+        Request::CreateVideoTrack(req) => on_create_video_track(server, req)?.into(),
+        Request::CreateAudioTrack(req) => on_create_audio_track(server, req)?.into(),
+        Request::LocalTrackMute(req) => on_local_track_mute(server, req)?.into(),
+        Request::EnableRemoteTrack(req) => on_enable_remote_track(server, req)?.into(),
+        Request::GetStats(req) => on_get_stats(server, req)?.into(),
+        Request::NewVideoStream(req) => on_new_video_stream(server, req)?.into(),
+        Request::VideoStreamFromParticipant(req) => {
+            on_video_stream_from_participant(server, req)?.into()
         }
-        proto::ffi_request::Message::Connect(connect) => {
-            proto::ffi_response::Message::Connect(on_connect(server, connect)?)
+        Request::NewVideoSource(req) => on_new_video_source(server, req)?.into(),
+        Request::CaptureVideoFrame(req) => unsafe { on_capture_video_frame(server, req)?.into() },
+        Request::VideoConvert(req) => unsafe { on_video_convert(server, req)?.into() },
+        Request::NewAudioStream(req) => on_new_audio_stream(server, req)?.into(),
+        Request::NewAudioSource(req) => on_new_audio_source(server, req)?.into(),
+        Request::AudioStreamFromParticipant(req) => {
+            on_audio_stream_from_participant_stream(server, req)?.into()
         }
-        proto::ffi_request::Message::Disconnect(disconnect) => {
-            proto::ffi_response::Message::Disconnect(on_disconnect(server, disconnect)?)
+        Request::CaptureAudioFrame(req) => on_capture_audio_frame(server, req)?.into(),
+        Request::ClearAudioBuffer(req) => on_clear_audio_buffer(server, req)?.into(),
+        Request::NewAudioResampler(req) => new_audio_resampler(server, req)?.into(),
+        Request::RemixAndResample(req) => remix_and_resample(server, req)?.into(),
+        Request::E2ee(req) => on_e2ee_request(server, req)?.into(),
+        Request::GetSessionStats(req) => on_get_session_stats(server, req)?.into(),
+        Request::NewSoxResampler(req) => on_new_sox_resampler(server, req)?.into(),
+        Request::PushSoxResampler(req) => on_push_sox_resampler(server, req)?.into(),
+        Request::FlushSoxResampler(req) => on_flush_sox_resampler(server, req)?.into(),
+        Request::NewApm(req) => on_new_apm(server, req)?.into(),
+        Request::ApmProcessStream(req) => on_apm_process_stream(server, req)?.into(),
+        Request::ApmProcessReverseStream(req) => on_apm_process_reverse_stream(server, req)?.into(),
+        Request::ApmSetStreamDelay(req) => on_apm_set_stream_delay(server, req)?.into(),
+        Request::PerformRpc(req) => on_perform_rpc(server, req)?.into(),
+        Request::RegisterRpcMethod(req) => on_register_rpc_method(server, req)?.into(),
+        Request::UnregisterRpcMethod(req) => on_unregister_rpc_method(server, req)?.into(),
+        Request::RpcMethodInvocationResponse(req) => {
+            on_rpc_method_invocation_response(server, req)?.into()
         }
-        proto::ffi_request::Message::PublishTrack(publish) => {
-            proto::ffi_response::Message::PublishTrack(on_publish_track(server, publish)?)
+        Request::EnableRemoteTrackPublication(req) => {
+            on_enable_remote_track_publication(server, req)?.into()
         }
-        proto::ffi_request::Message::UnpublishTrack(unpublish) => {
-            proto::ffi_response::Message::UnpublishTrack(on_unpublish_track(server, unpublish)?)
+        Request::UpdateRemoteTrackPublicationDimension(req) => {
+            on_update_remote_track_publication_dimension(server, req)?.into()
         }
-        proto::ffi_request::Message::PublishData(publish) => {
-            proto::ffi_response::Message::PublishData(on_publish_data(server, publish)?)
+        Request::SetRemoteTrackPublicationQuality(req) => {
+            on_set_remote_track_publication_quality(server, req)?.into()
         }
-        proto::ffi_request::Message::PublishTranscription(publish) => {
-            proto::ffi_response::Message::PublishTranscription(on_publish_transcription(
-                server, publish,
-            )?)
+        Request::SendStreamHeader(req) => on_send_stream_header(server, req)?.into(),
+        Request::SendStreamChunk(req) => on_send_stream_chunk(server, req)?.into(),
+        Request::SendStreamTrailer(req) => on_send_stream_trailer(server, req)?.into(),
+        Request::SetDataChannelBufferedAmountLowThreshold(req) => {
+            on_set_data_channel_buffered_amount_low_threshold(server, req)?.into()
         }
-        proto::ffi_request::Message::PublishSipDtmf(publish) => {
-            proto::ffi_response::Message::PublishSipDtmf(on_publish_sip_dtmf(server, publish)?)
+        Request::ByteReadIncremental(req) => {
+            on_byte_stream_reader_read_incremental(server, req)?.into()
         }
-        proto::ffi_request::Message::SetSubscribed(subscribed) => {
-            proto::ffi_response::Message::SetSubscribed(on_set_subscribed(server, subscribed)?)
+        Request::ByteReadAll(req) => on_byte_stream_reader_read_all(server, req)?.into(),
+        Request::ByteWriteToFile(req) => on_byte_stream_reader_write_to_file(server, req)?.into(),
+        Request::TextReadIncremental(req) => {
+            on_text_stream_reader_read_incremental(server, req)?.into()
         }
-        proto::ffi_request::Message::SetLocalMetadata(u) => {
-            proto::ffi_response::Message::SetLocalMetadata(on_set_local_metadata(server, u)?)
+        Request::TextReadAll(req) => on_text_stream_reader_read_all(server, req)?.into(),
+        Request::SendFile(req) => on_send_file(server, req)?.into(),
+        Request::SendBytes(req) => on_send_bytes(server, req)?.into(),
+        Request::SendText(req) => on_send_text(server, req)?.into(),
+        Request::ByteStreamOpen(req) => on_byte_stream_open(server, req)?.into(),
+        Request::ByteStreamWrite(req) => on_byte_stream_write(server, req)?.into(),
+        Request::ByteStreamClose(req) => on_byte_stream_close(server, req)?.into(),
+        Request::TextStreamOpen(req) => on_text_stream_open(server, req)?.into(),
+        Request::TextStreamWrite(req) => on_text_stream_write(server, req)?.into(),
+        Request::TextStreamClose(req) => on_text_stream_close(server, req)?.into(),
+        Request::LoadAudioFilterPlugin(req) => on_load_audio_filter_plugin(server, req)?.into(),
+        Request::SetTrackSubscriptionPermissions(req) => {
+            on_set_track_subscription_permissions(server, req)?.into()
         }
-        proto::ffi_request::Message::SetLocalName(update) => {
-            proto::ffi_response::Message::SetLocalName(on_set_local_name(server, update)?)
+        Request::PublishDataTrack(req) => on_publish_data_track(server, req)?.into(),
+        Request::LocalDataTrackIsPublished(req) => {
+            on_local_data_track_is_published(server, req)?.into()
         }
-        proto::ffi_request::Message::SetLocalAttributes(update) => {
-            proto::ffi_response::Message::SetLocalAttributes(on_set_local_attributes(
-                server, update,
-            )?)
+        Request::LocalDataTrackUnpublish(req) => on_local_data_track_unpublish(server, req)?.into(),
+        Request::LocalDataTrackTryPush(req) => on_local_data_track_try_push(server, req)?.into(),
+        Request::SubscribeDataTrack(req) => on_subscribe_local_data_track(server, req)?.into(),
+        Request::RemoteDataTrackIsPublished(req) => {
+            on_remote_data_track_is_published(server, req)?.into()
         }
-        proto::ffi_request::Message::SendChatMessage(update) => {
-            proto::ffi_response::Message::SendChatMessage(on_send_chat_message(server, update)?)
+        Request::RemoteDataTrackSetPipelineOptions(req) => {
+            on_remote_data_track_set_pipeline_options(server, req)?.into()
         }
-        proto::ffi_request::Message::EditChatMessage(update) => {
-            proto::ffi_response::Message::SendChatMessage(on_edit_chat_message(server, update)?)
+        Request::DataTrackStreamRead(req) => on_data_track_stream_read(server, req)?.into(),
+        Request::DefineSchema(req) => on_define_schema(server, req)?.into(),
+        Request::GetSchema(req) => on_get_schema(server, req)?.into(),
+        // Platform Audio
+        Request::NewPlatformAudio(req) => {
+            platform_audio::on_new_platform_audio(server, req)?.into()
         }
-        proto::ffi_request::Message::CreateVideoTrack(create) => {
-            proto::ffi_response::Message::CreateVideoTrack(on_create_video_track(server, create)?)
+        Request::GetAudioDevices(req) => platform_audio::on_get_audio_devices(server, req)?.into(),
+        Request::SetRecordingDevice(req) => {
+            platform_audio::on_set_recording_device(server, req)?.into()
         }
-        proto::ffi_request::Message::CreateAudioTrack(create) => {
-            proto::ffi_response::Message::CreateAudioTrack(on_create_audio_track(server, create)?)
+        Request::SetPlayoutDevice(req) => {
+            platform_audio::on_set_playout_device(server, req)?.into()
         }
-        proto::ffi_request::Message::LocalTrackMute(create) => {
-            proto::ffi_response::Message::LocalTrackMute(on_local_track_mute(server, create)?)
-        }
-        proto::ffi_request::Message::EnableRemoteTrack(create) => {
-            proto::ffi_response::Message::EnableRemoteTrack(on_enable_remote_track(server, create)?)
-        }
-        proto::ffi_request::Message::GetStats(get_stats) => {
-            proto::ffi_response::Message::GetStats(on_get_stats(server, get_stats)?)
-        }
-        proto::ffi_request::Message::NewVideoStream(new_stream) => {
-            proto::ffi_response::Message::NewVideoStream(on_new_video_stream(server, new_stream)?)
-        }
-        proto::ffi_request::Message::VideoStreamFromParticipant(new_stream) => {
-            proto::ffi_response::Message::VideoStreamFromParticipant(
-                on_video_stream_from_participant(server, new_stream)?,
-            )
-        }
-        proto::ffi_request::Message::NewVideoSource(new_source) => {
-            proto::ffi_response::Message::NewVideoSource(on_new_video_source(server, new_source)?)
-        }
-        proto::ffi_request::Message::CaptureVideoFrame(push) => unsafe {
-            proto::ffi_response::Message::CaptureVideoFrame(on_capture_video_frame(server, push)?)
-        },
-        proto::ffi_request::Message::VideoConvert(video_convert) => unsafe {
-            proto::ffi_response::Message::VideoConvert(on_video_convert(server, video_convert)?)
-        },
-        proto::ffi_request::Message::NewAudioStream(new_stream) => {
-            proto::ffi_response::Message::NewAudioStream(on_new_audio_stream(server, new_stream)?)
-        }
-        proto::ffi_request::Message::NewAudioSource(new_source) => {
-            proto::ffi_response::Message::NewAudioSource(on_new_audio_source(server, new_source)?)
-        }
-        proto::ffi_request::Message::AudioStreamFromParticipant(new_stream) => {
-            proto::ffi_response::Message::AudioStreamFromParticipant(
-                on_audio_stream_from_participant_stream(server, new_stream)?,
-            )
-        }
-        proto::ffi_request::Message::CaptureAudioFrame(push) => {
-            proto::ffi_response::Message::CaptureAudioFrame(on_capture_audio_frame(server, push)?)
-        }
-        proto::ffi_request::Message::ClearAudioBuffer(clear) => {
-            proto::ffi_response::Message::ClearAudioBuffer(on_clear_audio_buffer(server, clear)?)
-        }
-        proto::ffi_request::Message::NewAudioResampler(new_res) => {
-            proto::ffi_response::Message::NewAudioResampler(new_audio_resampler(server, new_res)?)
-        }
-        proto::ffi_request::Message::RemixAndResample(remix) => {
-            proto::ffi_response::Message::RemixAndResample(remix_and_resample(server, remix)?)
-        }
-        proto::ffi_request::Message::E2ee(e2ee) => {
-            proto::ffi_response::Message::E2ee(on_e2ee_request(server, e2ee)?)
-        }
-        proto::ffi_request::Message::GetSessionStats(get_session_stats) => {
-            proto::ffi_response::Message::GetSessionStats(on_get_session_stats(
-                server,
-                get_session_stats,
-            )?)
-        }
-        proto::ffi_request::Message::NewSoxResampler(new_soxr) => {
-            proto::ffi_response::Message::NewSoxResampler(on_new_sox_resampler(server, new_soxr)?)
-        }
-        proto::ffi_request::Message::PushSoxResampler(push_soxr) => {
-            proto::ffi_response::Message::PushSoxResampler(on_push_sox_resampler(
-                server, push_soxr,
-            )?)
-        }
-        proto::ffi_request::Message::FlushSoxResampler(flush_soxr) => {
-            proto::ffi_response::Message::FlushSoxResampler(on_flush_sox_resampler(
-                server, flush_soxr,
-            )?)
-        }
-        proto::ffi_request::Message::NewApm(new_apm) => {
-            proto::ffi_response::Message::NewApm(on_new_apm(server, new_apm)?)
-        }
-        proto::ffi_request::Message::ApmProcessStream(request) => {
-            proto::ffi_response::Message::ApmProcessStream(on_apm_process_stream(server, request)?)
-        }
-        proto::ffi_request::Message::ApmProcessReverseStream(request) => {
-            proto::ffi_response::Message::ApmProcessReverseStream(on_apm_process_reverse_stream(
-                server, request,
-            )?)
-        }
-        proto::ffi_request::Message::ApmSetStreamDelay(request) => {
-            proto::ffi_response::Message::ApmSetStreamDelay(on_apm_set_stream_delay(
-                server, request,
-            )?)
-        }
-        proto::ffi_request::Message::PerformRpc(request) => {
-            proto::ffi_response::Message::PerformRpc(on_perform_rpc(server, request)?)
-        }
-        proto::ffi_request::Message::RegisterRpcMethod(request) => {
-            proto::ffi_response::Message::RegisterRpcMethod(on_register_rpc_method(
-                server, request,
-            )?)
-        }
-        proto::ffi_request::Message::UnregisterRpcMethod(request) => {
-            proto::ffi_response::Message::UnregisterRpcMethod(on_unregister_rpc_method(
-                server, request,
-            )?)
-        }
-        proto::ffi_request::Message::RpcMethodInvocationResponse(request) => {
-            proto::ffi_response::Message::RpcMethodInvocationResponse(
-                on_rpc_method_invocation_response(server, request)?,
-            )
-        }
-        proto::ffi_request::Message::EnableRemoteTrackPublication(request) => {
-            proto::ffi_response::Message::EnableRemoteTrackPublication(
-                on_enable_remote_track_publication(server, request)?,
-            )
-        }
-        proto::ffi_request::Message::UpdateRemoteTrackPublicationDimension(request) => {
-            proto::ffi_response::Message::UpdateRemoteTrackPublicationDimension(
-                on_update_remote_track_publication_dimension(server, request)?,
-            )
-        }
-        proto::ffi_request::Message::SendStreamHeader(request) => {
-            proto::ffi_response::Message::SendStreamHeader(on_send_stream_header(server, request)?)
-        }
-        proto::ffi_request::Message::SendStreamChunk(request) => {
-            proto::ffi_response::Message::SendStreamChunk(on_send_stream_chunk(server, request)?)
-        }
-        proto::ffi_request::Message::SendStreamTrailer(request) => {
-            proto::ffi_response::Message::SendStreamTrailer(on_send_stream_trailer(
-                server, request,
-            )?)
-        }
-        proto::ffi_request::Message::SetDataChannelBufferedAmountLowThreshold(request) => {
-            proto::ffi_response::Message::SetDataChannelBufferedAmountLowThreshold(
-                on_set_data_channel_buffered_amount_low_threshold(server, request)?,
-            )
-        }
-        proto::ffi_request::Message::ByteReadIncremental(request) => {
-            proto::ffi_response::Message::ByteReadIncremental(
-                on_byte_stream_reader_read_incremental(server, request)?,
-            )
-        }
-        proto::ffi_request::Message::ByteReadAll(request) => {
-            proto::ffi_response::Message::ByteReadAll(on_byte_stream_reader_read_all(
-                server, request,
-            )?)
-        }
-        proto::ffi_request::Message::ByteWriteToFile(request) => {
-            proto::ffi_response::Message::ByteWriteToFile(on_byte_stream_reader_write_to_file(
-                server, request,
-            )?)
-        }
-        proto::ffi_request::Message::TextReadIncremental(request) => {
-            proto::ffi_response::Message::TextReadIncremental(
-                on_text_stream_reader_read_incremental(server, request)?,
-            )
-        }
-        proto::ffi_request::Message::TextReadAll(request) => {
-            proto::ffi_response::Message::TextReadAll(on_text_stream_reader_read_all(
-                server, request,
-            )?)
-        }
-        proto::ffi_request::Message::SendFile(request) => {
-            proto::ffi_response::Message::SendFile(on_send_file(server, request)?)
-        }
-        proto::ffi_request::Message::SendText(request) => {
-            proto::ffi_response::Message::SendText(on_send_text(server, request)?)
-        }
-        proto::ffi_request::Message::ByteStreamOpen(request) => {
-            proto::ffi_response::Message::ByteStreamOpen(on_byte_stream_open(server, request)?)
-        }
-        proto::ffi_request::Message::ByteStreamWrite(request) => {
-            proto::ffi_response::Message::ByteStreamWrite(on_byte_stream_write(server, request)?)
-        }
-        proto::ffi_request::Message::ByteStreamClose(request) => {
-            proto::ffi_response::Message::ByteStreamClose(on_byte_stream_close(server, request)?)
-        }
-        proto::ffi_request::Message::TextStreamOpen(request) => {
-            proto::ffi_response::Message::TextStreamOpen(on_text_stream_open(server, request)?)
-        }
-        proto::ffi_request::Message::TextStreamWrite(request) => {
-            proto::ffi_response::Message::TextStreamWrite(on_text_stream_write(server, request)?)
-        }
-        proto::ffi_request::Message::TextStreamClose(request) => {
-            proto::ffi_response::Message::TextStreamClose(on_text_stream_close(server, request)?)
-        }
-        proto::ffi_request::Message::LoadAudioFilterPlugin(request) => {
-            proto::ffi_response::Message::LoadAudioFilterPlugin(on_load_audio_filter_plugin(
-                server, request,
-            )?)
-        }
-        proto::ffi_request::Message::SetTrackSubscriptionPermissions(request) => {
-            proto::ffi_response::Message::SetTrackSubscriptionPermissions(
-                on_set_track_subscription_permissions(server, request)?,
-            )
-        }
+        Request::StartRecording(req) => platform_audio::on_start_recording(server, req)?.into(),
+        Request::StopRecording(req) => platform_audio::on_stop_recording(server, req)?.into(),
     });
 
     Ok(res)

@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
 
 use std::{fmt::Debug, sync::Arc};
 
+use libwebrtc::enum_dispatch;
 use libwebrtc::{prelude::*, stats::RtcStats};
-use livekit_protocol::enum_dispatch;
 use livekit_protocol::{self as proto};
 use parking_lot::{Mutex, RwLock};
 use thiserror::Error;
@@ -70,6 +70,24 @@ pub enum TrackSource {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrackDimension(pub u32, pub u32);
 
+/// Video quality for simulcasted tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum VideoQuality {
+    Low,
+    Medium,
+    High,
+}
+
+impl From<VideoQuality> for proto::VideoQuality {
+    fn from(quality: VideoQuality) -> Self {
+        match quality {
+            VideoQuality::Low => Self::Low,
+            VideoQuality::Medium => Self::Medium,
+            VideoQuality::High => Self::High,
+        }
+    }
+}
+
 macro_rules! track_dispatch {
     ([$($variant:ident),+]) => {
         enum_dispatch!(
@@ -121,6 +139,18 @@ impl Track {
             Self::RemoteAudio(track) => track.get_stats().await,
             Self::RemoteVideo(track) => track.get_stats().await,
         }
+    }
+
+    /// Returns the codec clock rate from the receiver's RTP parameters.
+    /// This is the actual sample rate of the audio delivered by WebRTC's decoder.
+    pub fn codec_clock_rate(&self) -> Option<u32> {
+        self.transceiver()?
+            .receiver()
+            .parameters()
+            .codecs
+            .first()
+            .and_then(|c| c.clock_rate)
+            .map(|r| r as u32)
     }
 }
 
@@ -196,7 +226,7 @@ pub(super) fn set_muted(inner: &Arc<TrackInner>, track: &Track, muted: bool) {
         if let Some(on_mute) = inner.events.lock().muted.as_ref() {
             on_mute(track.clone());
         }
-    } else if let Some(on_unmute) = inner.events.lock().muted.as_ref() {
+    } else if let Some(on_unmute) = inner.events.lock().unmuted.as_ref() {
         on_unmute(track.clone());
     }
 }

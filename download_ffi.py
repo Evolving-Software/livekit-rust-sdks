@@ -1,4 +1,4 @@
-# Copyright 2023 LiveKit, Inc.
+# Copyright 2025 LiveKit, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
 
 # This file is used to download prebuilt binaries of livekit-ffi from our GH releases.
 # It is mostly used by our bindings (e.g https://github.com/livekit/client-sdk-python)
@@ -74,13 +73,16 @@ def ffi_version():
 
 def download_ffi(platform, arch, version, output):
     filename = "ffi-%s-%s.zip" % (platform, arch)
-    url = "https://github.com/livekit/client-sdk-rust/releases/download/rust-sdks/livekit-ffi@%s/%s"
-    url = url % (version, filename)
+    repo_url = "https://github.com/livekit/rust-sdks/releases/download"
+    new_url = "%s/livekit-ffi/v%s/%s" % (repo_url, version, filename)
+    old_url = "%s/rust-sdks/livekit-ffi@%s/%s" % (repo_url, version, filename)
 
     tmp = os.path.join(tempfile.gettempdir(), filename)
 
-    # download the binary
-    resp = requests.get(url, stream=True)
+    # try new tag format first, fall back to old format
+    resp = requests.get(new_url, stream=True)
+    if resp.status_code != 200:
+        resp = requests.get(old_url, stream=True)
     if resp.status_code != 200:
         raise Exception("failed to download, status: %d" % (resp.status_code))
 

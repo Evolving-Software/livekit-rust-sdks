@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -38,6 +38,11 @@ impl From<&FfiPublication> for proto::TrackPublicationInfo {
                 .audio_features()
                 .into_iter()
                 .map(|i| proto::AudioTrackFeature::from(i).into())
+                .collect(),
+            frame_metadata_features: publication
+                .frame_metadata_features()
+                .into_iter()
+                .map(|i| proto::FrameMetadataFeature::from(i).into())
                 .collect(),
         }
     }
@@ -155,6 +160,22 @@ impl From<AudioTrackFeature> for proto::AudioTrackFeature {
                 proto::AudioTrackFeature::TfEnhancedNoiseCancellation
             }
             AudioTrackFeature::TfPreconnectBuffer => proto::AudioTrackFeature::TfPreconnectBuffer,
+        }
+    }
+}
+
+impl From<livekit_protocol::PacketTrailerFeature> for proto::FrameMetadataFeature {
+    fn from(value: livekit_protocol::PacketTrailerFeature) -> Self {
+        match value {
+            livekit_protocol::PacketTrailerFeature::PtfUserTimestamp => {
+                proto::FrameMetadataFeature::FmfUserTimestamp
+            }
+            livekit_protocol::PacketTrailerFeature::PtfFrameId => {
+                proto::FrameMetadataFeature::FmfFrameId
+            }
+            livekit_protocol::PacketTrailerFeature::PtfUserData => {
+                proto::FrameMetadataFeature::FmfUserData
+            }
         }
     }
 }

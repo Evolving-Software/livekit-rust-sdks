@@ -1,80 +1,59 @@
 name: Release
 
-permissions:
-  pull-requests: write
-  contents: write
-  actions: write
-
 on:
-  push:
-    branches:
-      - main
+  pull_request:
+    types: [closed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run: build artifacts but skip publishing/releasing."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: write
 
 jobs:
-  # Release unpublished packages.
-  release-plz-release:
-    name: Release-plz release
+  publish-crates:
+    if: (github.head_ref == 'knope/release' && github.event.pull_request.merged == true) || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    if: ${{ github.repository_owner == 'livekit' }}
-    permissions:
-      contents: write
-    outputs:
-      ffi_tag: ${{ steps.ffi.outputs.ffi_tag }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
-          fetch-depth: 0
           submodules: recursive
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run release-plz
-        uses: release-plz/action@v0.5
-        id: release-plz
-        with:
-          command: release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
-      - name: Extract ffi tag
-        id: ffi
-        env:
-          RELEASES: ${{ steps.release-plz.outputs.releases }}
-        run: |
-          set -e
-          ffi_tag=$(echo "$RELEASES" | jq -r '.[].tag' | grep 'rust-sdks/livekit-ffi@' || true)
-          echo "ffi_tag=$ffi_tag"
-          echo "ffi_tag=$ffi_tag" >> $GITHUB_OUTPUT
 
-  call-ffi:
-    name: Call FFI Builds
-    if: ${{ needs.release-plz-release.outputs.ffi_tag != '' }}
-    uses: ./.github/workflows/ffi-builds.yml
-    needs: release-plz-release
+      - name: Setup Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
+        with:
+          cache: false
+          rustflags: ""
+
+      # The release PR check (release-pr-check.yml) is the primary gate. This
+      # step also covers a workflow_dispatch run, which has no release PR.
+      - name: Check crates exist on crates.io
+        run: .github/scripts/check_crates_published.sh
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@30b5ca8b54e1dcffd9548bc87ede1531310fdc67 # v1.20.0
+
+      - name: Install cargo-release
+        run: cargo binstall cargo-release@1.1.2 --no-confirm
+
+      - name: Authenticate with crates.io
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish to crates.io
+        run: cargo release publish --workspace --no-confirm --no-verify ${{ inputs.dry_run != true && '--execute' || '' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+
+  call-node-ffi:
+    name: Call Node FFI Builds
+    if: (github.head_ref == 'knope/release' && github.event.pull_request.merged == true) || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/node-builds.yml
     with:
-      tag: ${{ needs.release-plz-release.outputs.ffi_tag }}
-
-  # Create a PR with the new versions and changelog, preparing the next release.
-  release-plz-pr:
-    name: Release-plz PR
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    concurrency:
-      group: release-plz-${{ github.ref }}
-      cancel-in-progress: false
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-      - name: Run release-plz
-        uses: release-plz/action@v0.5
-        with:
-          command: release-pr
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_TOKEN }}
+      dry_run: ${{ inputs.dry_run || false }}

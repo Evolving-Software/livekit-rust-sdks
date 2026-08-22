@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 use std::{fmt::Debug, sync::Arc};
 
-use livekit_protocol::{self as proto, AudioTrackFeature};
+use livekit_protocol::{self as proto, AudioTrackFeature, PacketTrailerFeature};
 use parking_lot::Mutex;
 
 use super::TrackPublicationInner;
@@ -148,5 +148,9 @@ impl LocalTrackPublication {
 
     pub fn audio_features(&self) -> Vec<AudioTrackFeature> {
         self.inner.info.read().audio_features.clone()
+    }
+
+    pub fn frame_metadata_features(&self) -> Vec<PacketTrailerFeature> {
+        self.inner.info.read().frame_metadata_features.clone()
     }
 }

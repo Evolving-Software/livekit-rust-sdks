@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,6 +16,9 @@ use crate::{proto, server::participant::FfiParticipant};
 use livekit::prelude::*;
 use livekit::DisconnectReason;
 use livekit::ParticipantKind;
+use livekit::ParticipantKindDetail;
+use livekit::ParticipantState;
+use livekit_protocol as livekit_proto;
 
 impl From<&FfiParticipant> for proto::ParticipantInfo {
     fn from(value: &FfiParticipant) -> Self {
@@ -25,15 +28,38 @@ impl From<&FfiParticipant> for proto::ParticipantInfo {
 
 impl From<&Participant> for proto::ParticipantInfo {
     fn from(participant: &Participant) -> Self {
+        // Convert permission if present
+        let permission = participant.permission().map(|p| (&p).into());
+
         Self {
             sid: participant.sid().into(),
             name: participant.name(),
             identity: participant.identity().into(),
+            state: proto::ParticipantState::from(participant.state()).into(),
             metadata: participant.metadata(),
             attributes: participant.attributes(),
             kind: proto::ParticipantKind::from(participant.kind()).into(),
             disconnect_reason: proto::DisconnectReason::from(participant.disconnect_reason())
                 .into(),
+            joined_at: participant.joined_at(),
+            kind_details: participant
+                .kind_details()
+                .into_iter()
+                .map(|k| proto::ParticipantKindDetail::from(k).into())
+                .collect(),
+            permission,
+            client_protocol: participant.client_protocol(),
+        }
+    }
+}
+
+impl From<ParticipantState> for proto::ParticipantState {
+    fn from(state: ParticipantState) -> Self {
+        match state {
+            ParticipantState::Joining => proto::ParticipantState::Joining,
+            ParticipantState::Joined => proto::ParticipantState::Joined,
+            ParticipantState::Active => proto::ParticipantState::Active,
+            ParticipantState::Disconnected => proto::ParticipantState::Disconnected,
         }
     }
 }
@@ -46,6 +72,23 @@ impl From<ParticipantKind> for proto::ParticipantKind {
             ParticipantKind::Ingress => proto::ParticipantKind::Ingress,
             ParticipantKind::Egress => proto::ParticipantKind::Egress,
             ParticipantKind::Agent => proto::ParticipantKind::Agent,
+            ParticipantKind::Connector => proto::ParticipantKind::Connector,
+            ParticipantKind::Bridge => proto::ParticipantKind::Bridge,
+        }
+    }
+}
+
+impl From<ParticipantKindDetail> for proto::ParticipantKindDetail {
+    fn from(kind_detail: ParticipantKindDetail) -> Self {
+        match kind_detail {
+            ParticipantKindDetail::CloudAgent => proto::ParticipantKindDetail::CloudAgent,
+            ParticipantKindDetail::Forwarded => proto::ParticipantKindDetail::Forwarded,
+            ParticipantKindDetail::ConnectorWhatsapp => {
+                proto::ParticipantKindDetail::ConnectorWhatsapp
+            }
+            ParticipantKindDetail::ConnectorTwilio => proto::ParticipantKindDetail::ConnectorTwilio,
+            ParticipantKindDetail::BridgeRtsp => proto::ParticipantKindDetail::BridgeRtsp,
+            ParticipantKindDetail::Simulation => proto::ParticipantKindDetail::Simulation,
         }
     }
 }
@@ -69,6 +112,22 @@ impl From<DisconnectReason> for proto::DisconnectReason {
             DisconnectReason::SipTrunkFailure => proto::DisconnectReason::SipTrunkFailure,
             DisconnectReason::ConnectionTimeout => proto::DisconnectReason::ConnectionTimeout,
             DisconnectReason::MediaFailure => proto::DisconnectReason::MediaFailure,
+            DisconnectReason::AgentError => proto::DisconnectReason::AgentError,
+        }
+    }
+}
+
+impl From<&livekit_proto::ParticipantPermission> for proto::ParticipantPermission {
+    fn from(perm: &livekit_proto::ParticipantPermission) -> Self {
+        proto::ParticipantPermission {
+            can_subscribe: perm.can_subscribe,
+            can_publish: perm.can_publish,
+            can_publish_data: perm.can_publish_data,
+            can_publish_sources: perm.can_publish_sources.clone(),
+            hidden: perm.hidden,
+            can_update_metadata: perm.can_update_metadata,
+            can_subscribe_metrics: perm.can_subscribe_metrics,
+            can_manage_agent_session: perm.can_manage_agent_session,
         }
     }
 }

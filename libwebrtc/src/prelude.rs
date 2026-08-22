@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -30,7 +30,7 @@ pub use crate::{
     },
     rtp_parameters::*,
     rtp_receiver::RtpReceiver,
-    rtp_sender::RtpSender,
+    rtp_sender::{RtpSender, VideoEncoderBackend},
     rtp_transceiver::{RtpTransceiver, RtpTransceiverDirection, RtpTransceiverInit},
     session_description::{SdpType, SessionDescription},
     video_frame::{

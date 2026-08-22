@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -16,11 +16,13 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 
 #include "api/media_stream_interface.h"
 #include "api/video/video_frame.h"
 #include "livekit/helper.h"
+#include "livekit/encoded_video_frame_buffer.h"
 #include "livekit/media_stream_track.h"
 #include "livekit/video_frame.h"
 #include "livekit/webrtc.h"
@@ -29,20 +31,21 @@
 #include "rtc_base/timestamp_aligner.h"
 #include "rust/cxx.h"
 
-namespace livekit {
+namespace livekit_ffi {
 class VideoTrack;
 class NativeVideoSink;
 class VideoTrackSource;
-}  // namespace livekit
+class PacketTrailerHandler;  // forward declaration to avoid circular include
+}  // namespace livekit_ffi
 #include "webrtc-sys/src/video_track.rs.h"
 
-namespace livekit {
+namespace livekit_ffi {
 
 class VideoTrack : public MediaStreamTrack {
  private:
   friend RtcRuntime;
   VideoTrack(std::shared_ptr<RtcRuntime> rtc_runtime,
-             rtc::scoped_refptr<webrtc::VideoTrackInterface> track);
+             webrtc::scoped_refptr<webrtc::VideoTrackInterface> track);
 
  public:
   ~VideoTrack();
@@ -68,7 +71,7 @@ class VideoTrack : public MediaStreamTrack {
   mutable std::vector<std::shared_ptr<NativeVideoSink>> sinks_;
 };
 
-class NativeVideoSink : public rtc::VideoSinkInterface<webrtc::VideoFrame> {
+class NativeVideoSink : public webrtc::VideoSinkInterface<webrtc::VideoFrame> {
  public:
   explicit NativeVideoSink(rust::Box<VideoSinkWrapper> observer);
 
@@ -85,43 +88,89 @@ std::shared_ptr<NativeVideoSink> new_native_video_sink(
     rust::Box<VideoSinkWrapper> observer);
 
 class VideoTrackSource {
-  class InternalSource : public rtc::AdaptedVideoTrackSource {
+  class InternalSource : public webrtc::AdaptedVideoTrackSource {
    public:
-    InternalSource(const VideoResolution&
-                       resolution);  // (0, 0) means no resolution/optional, the
-                                     // source will guess the resolution at the
-                                     // first captured frame
+    InternalSource(const VideoResolution& resolution,
+                   bool is_screencast);  // (0, 0) means no resolution/optional, the
+                                         // source will guess the resolution at the
+                                         // first captured frame
     ~InternalSource() override;
 
     bool is_screencast() const override;
-    absl::optional<bool> needs_denoising() const override;
+    std::optional<bool> needs_denoising() const override;
     SourceState state() const override;
     bool remote() const override;
     VideoResolution video_resolution() const;
-    bool on_captured_frame(const webrtc::VideoFrame& frame);
+    bool on_captured_frame(const webrtc::VideoFrame& frame,
+                           const FrameMetadata& frame_metadata);
+
+    void set_packet_trailer_handler(
+        std::shared_ptr<PacketTrailerHandler> handler);
+
+    // Shared with every EncodedVideoFrameBuffer this source emits; the
+    // pass-through encoder raises it on unsatisfied keyframe requests.
+    std::shared_ptr<std::atomic<bool>> keyframe_request_flag() const {
+      return keyframe_request_flag_;
+    }
+    std::shared_ptr<livekit::EncodedRateControlState> rate_control_state()
+        const {
+      return rate_control_state_;
+    }
 
    private:
     mutable webrtc::Mutex mutex_;
-    rtc::TimestampAligner timestamp_aligner_;
+    webrtc::TimestampAligner timestamp_aligner_;
     VideoResolution resolution_;
+    std::shared_ptr<PacketTrailerHandler> packet_trailer_handler_;
+    std::shared_ptr<std::atomic<bool>> keyframe_request_flag_ =
+        std::make_shared<std::atomic<bool>>(false);
+    std::shared_ptr<livekit::EncodedRateControlState> rate_control_state_ =
+        std::make_shared<livekit::EncodedRateControlState>();
+    bool is_screencast_;
   };
 
  public:
-  VideoTrackSource(const VideoResolution& resolution);
+  VideoTrackSource(const VideoResolution& resolution, bool is_screencast);
 
   VideoResolution video_resolution() const;
 
-  bool on_captured_frame(const std::unique_ptr<VideoFrame>& frame)
+  bool on_captured_frame(const std::unique_ptr<VideoFrame>& frame,
+                         const FrameMetadata& frame_metadata)
       const;  // frames pushed from Rust (+interior mutability)
 
-  rtc::scoped_refptr<InternalSource> get() const;
+  // Single-call DmaBuf capture: creates the DmaBufVideoFrameBuffer and
+  // VideoFrame internally, avoiding multiple FFI round-trips and heap
+  // allocations on the hot path.
+  bool capture_dmabuf_frame(int dmabuf_fd,
+                            int width,
+                            int height,
+                            int pixel_format,
+                            int64_t timestamp_us,
+                            const FrameMetadata& frame_metadata) const;
+
+  bool capture_encoded_frame(int width,
+                             int height,
+                             const EncodedVideoFrameData& frame,
+                             rust::Slice<const uint8_t> payload,
+                             const FrameMetadata& frame_metadata) const;
+
+  // Returns and clears the pending upstream keyframe request raised by the
+  // pass-through encoder (PLI/FIR or post-reconfigure). Poll from the
+  // capture loop.
+  bool take_keyframe_request() const;
+  EncodedRateControlRequest take_rate_control_request() const;
+
+  void set_packet_trailer_handler(
+      std::shared_ptr<PacketTrailerHandler> handler) const;
+
+  webrtc::scoped_refptr<InternalSource> get() const;
 
  private:
-  rtc::scoped_refptr<InternalSource> source_;
+  webrtc::scoped_refptr<InternalSource> source_;
 };
 
 std::shared_ptr<VideoTrackSource> new_video_track_source(
-    const VideoResolution& resolution);
+    const VideoResolution& resolution, bool is_screencast);
 
 static std::shared_ptr<MediaStreamTrack> video_to_media(
     std::shared_ptr<VideoTrack> track) {
@@ -137,4 +186,4 @@ static std::shared_ptr<VideoTrack> _shared_video_track() {
   return nullptr;  // Ignore
 }
 
-}  // namespace livekit
+}  // namespace livekit_ffi

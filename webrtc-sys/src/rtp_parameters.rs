@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 pub const DEFAULT_BITRATE_PRIORITY: f64 = 1.0;
 
-#[cxx::bridge(namespace = "livekit")]
+#[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
 
     // Used to replace std::map
@@ -53,7 +53,10 @@ pub mod ffi {
     #[derive(Debug)]
     #[repr(i32)]
     pub enum DegradationPreference {
-        Disabled,
+        /// Maintain both framerate and resolution. Frames may be dropped before encoding
+        /// if necessary to avoid overusing network and encoder resources.
+        /// Note: This was previously called `Disabled` in older WebRTC versions.
+        MaintainFramerateAndResolution,
         MaintainFramerate,
         MaintainResolution,
         Balanced,

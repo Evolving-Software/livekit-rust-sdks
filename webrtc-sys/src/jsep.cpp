@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -23,7 +23,7 @@
 #include "rtc_base/ref_counted_object.h"
 #include "rust/cxx.h"
 
-namespace livekit {
+namespace livekit_ffi {
 
 std::string serialize_sdp_error(webrtc::SdpParseError error) {
   std::stringstream ss;
@@ -110,6 +110,38 @@ std::unique_ptr<SessionDescription> create_session_description(
   return std::make_unique<SessionDescription>(std::move(rtc_sdp));
 }
 
+#ifdef LIVEKIT_TEST
+rust::String serialize_sdp_parse_error_for_test() {
+  webrtc::SdpParseError error;
+  auto rtc_sdp = webrtc::CreateSessionDescription(
+      webrtc::SdpType::kOffer,
+      "v=0\n"
+      "o=- 6549709950142776241 2 IN IP4 127.0.0.1\n"
+      "s=-\n"
+      "t=0 0\n"
+      "======================== ERROR HERE\n"
+      "a=group:BUNDLE 0\n"
+      "a=extmap-allow-mixed\n"
+      "a=msid-semantic: WMS\n"
+      "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\n"
+      "c=IN IP4 0.0.0.0\n"
+      "a=ice-ufrag:Tw7h\n"
+      "a=ice-pwd:6XOVUD6HpcB4c1M8EB8jXJE9\n"
+      "a=ice-options:trickle\n"
+      "a=fingerprint:sha-256 "
+      "4F:EC:23:59:5D:A5:E6:3E:3E:5D:8A:09:B6:FA:04:AA:19:99:49:67:BD:65:93:06:BB:EE:AC:D5:21:0F:57:D6\n"
+      "a=setup:actpass\n"
+      "a=mid:0\n"
+      "a=sctp-port:5000\n"
+      "a=max-message-size:262144\n",
+      &error);
+  if (rtc_sdp) {
+    return rust::String("");
+  }
+  return rust::String::lossy(serialize_sdp_error(error));
+}
+#endif
+
 NativeCreateSdpObserver::NativeCreateSdpObserver(
     rust::Box<PeerContext> ctx,
     rust::Fn<void(rust::Box<PeerContext>, std::unique_ptr<SessionDescription>)>
@@ -148,4 +180,4 @@ void NativeSetRemoteSdpObserver::OnSetRemoteDescriptionComplete(
     webrtc::RTCError error) {
   on_complete_(std::move(ctx_), to_error(error));
 }
-}  // namespace livekit
+}  // namespace livekit_ffi

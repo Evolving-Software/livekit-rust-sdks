@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
 
 use crate::impl_thread_safety;
 
-#[cxx::bridge(namespace = "livekit")]
+#[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
     #[derive(Debug)]
     #[repr(i32)]
@@ -87,8 +87,34 @@ pub mod ffi {
         fn stride_a(self: &I420ABuffer) -> u32;
         fn data_a(self: &I420ABuffer) -> *const u8;
 
+        fn scale(self: &I420Buffer, scaled_width: i32, scaled_height: i32)
+            -> UniquePtr<I420Buffer>;
+        fn scale(
+            self: &I420ABuffer,
+            scaled_width: i32,
+            scaled_height: i32,
+        ) -> UniquePtr<I420ABuffer>;
+        fn scale(self: &I422Buffer, scaled_width: i32, scaled_height: i32)
+            -> UniquePtr<I422Buffer>;
+        fn scale(self: &I444Buffer, scaled_width: i32, scaled_height: i32)
+            -> UniquePtr<I444Buffer>;
+        fn scale(self: &I010Buffer, scaled_width: i32, scaled_height: i32)
+            -> UniquePtr<I010Buffer>;
+        fn scale(self: &NV12Buffer, scaled_width: i32, scaled_height: i32)
+            -> UniquePtr<NV12Buffer>;
+
         fn copy_i420_buffer(i420: &UniquePtr<I420Buffer>) -> UniquePtr<I420Buffer>;
         fn new_i420_buffer(
+            width: i32,
+            height: i32,
+            stride_y: i32,
+            stride_u: i32,
+            stride_v: i32,
+        ) -> UniquePtr<I420Buffer>;
+
+        /// Like `new_i420_buffer`, but with the pixel data set to black
+        /// (Y=0, U=V=128) instead of left uninitialized.
+        fn new_black_i420_buffer(
             width: i32,
             height: i32,
             stride_y: i32,

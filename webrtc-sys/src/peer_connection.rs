@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ use std::any::Any;
 
 use crate::impl_thread_safety;
 
-#[cxx::bridge(namespace = "livekit")]
+#[cxx::bridge(namespace = "livekit_ffi")]
 pub mod ffi {
     #[repr(i32)]
     pub enum PeerConnectionState {
@@ -92,6 +92,9 @@ pub mod ffi {
         pub ice_servers: Vec<IceServer>,
         pub continual_gathering_policy: ContinualGatheringPolicy,
         pub ice_transport_type: IceTransportsType,
+        // WARP/SNAP: enable SCTP-INIT-in-SDP. Must be carried consistently across
+        // create + set_configuration (it is an immutable RTCConfiguration field).
+        pub enable_sctp_snap: bool,
     }
 
     extern "C++" {

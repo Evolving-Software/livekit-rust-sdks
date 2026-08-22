@@ -1,14 +1,14 @@
 /*
- * Copyright 2023 LiveKit
+ * Copyright 2025 LiveKit, Inc.
  *
- * Licensed under the Apache License, Version 2.0 (the “License”);
+ * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
  *     http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an “AS IS” BASIS,
+ * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
@@ -29,12 +29,12 @@
 #include "livekit/rtp_sender.h"
 #include "rust/cxx.h"
 
-namespace livekit {
+namespace livekit_ffi {
 class RtpTransceiver;
 }
 #include "webrtc-sys/src/rtp_transceiver.rs.h"
 
-namespace livekit {
+namespace livekit_ffi {
 
 webrtc::RtpTransceiverInit to_native_rtp_transceiver_init(
     RtpTransceiverInit init);
@@ -43,8 +43,8 @@ class RtpTransceiver {
  public:
   RtpTransceiver(
       std::shared_ptr<RtcRuntime> rtc_runtime,
-      rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver,
-      rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection);
+      webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver,
+      webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection);
 
   MediaType media_type() const;
 
@@ -82,12 +82,12 @@ class RtpTransceiver {
 
  private:
   std::shared_ptr<RtcRuntime> rtc_runtime_;
-  rtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver_;
-  rtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection_;
+  webrtc::scoped_refptr<webrtc::RtpTransceiverInterface> transceiver_;
+  webrtc::scoped_refptr<webrtc::PeerConnectionInterface> peer_connection_;
 };
 
 static std::shared_ptr<RtpTransceiver> _shared_rtp_transceiver() {
   return nullptr;
 }
 
-}  // namespace livekit
+}  // namespace livekit_ffi

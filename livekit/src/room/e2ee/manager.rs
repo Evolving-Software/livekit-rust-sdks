@@ -1,4 +1,4 @@
-// Copyright 2023 LiveKit, Inc.
+// Copyright 2025 LiveKit, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,10 +15,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use libwebrtc::{
-    native::frame_cryptor::{EncryptionAlgorithm, EncryptionState, FrameCryptor},
+    native::{
+        frame_cryptor::{
+            DataPacketCryptor, EncryptedPacket, EncryptionAlgorithm, EncryptionState, FrameCryptor,
+        },
+        packet_trailer,
+    },
     rtp_receiver::RtpReceiver,
     rtp_sender::RtpSender,
 };
+use livekit_protocol::PacketTrailerFeature;
 use parking_lot::Mutex;
 
 use super::{key_provider::KeyProvider, EncryptionType};
@@ -29,13 +35,28 @@ use crate::{
     prelude::{LocalTrack, LocalTrackPublication, RemoteTrack, RemoteTrackPublication},
     rtc_engine::lk_runtime::LkRuntime,
 };
+use std::fmt::Debug;
 
 type StateChangedHandler = Box<dyn Fn(ParticipantIdentity, EncryptionState) + Send>;
+
+fn has_packet_trailer_features(features: &[i32]) -> bool {
+    features.iter().any(|f| {
+        *f == PacketTrailerFeature::PtfUserTimestamp as i32
+            || *f == PacketTrailerFeature::PtfFrameId as i32
+            || *f == PacketTrailerFeature::PtfUserData as i32
+    })
+}
+
+fn needs_video_receiver_packet_trailer_handler(features: &[i32]) -> bool {
+    has_packet_trailer_features(features)
+}
 
 struct ManagerInner {
     options: Option<E2eeOptions>, // If Some, it means the e2ee was initialized
     enabled: bool,                // Used to enable/disable e2ee
+    dc_encryption_enabled: bool,
     frame_cryptors: HashMap<(ParticipantIdentity, TrackSid), FrameCryptor>,
+    data_packet_cryptor: Option<DataPacketCryptor>,
 }
 
 #[derive(Clone)]
@@ -47,12 +68,20 @@ pub struct E2eeManager {
 impl E2eeManager {
     /// E2eeOptions is an optional parameter. We may support to reconfigure e2ee after connect in
     /// the future.
-    pub(crate) fn new(options: Option<E2eeOptions>) -> Self {
+    pub(crate) fn new(options: Option<E2eeOptions>, with_dc_encryption: bool) -> Self {
+        // Create DataPacketCryptor whenever E2EE options are available
+        // This allows for decryption even if we're not encrypting our own data
+        let data_packet_cryptor = options.as_ref().map(|opts| {
+            DataPacketCryptor::new(EncryptionAlgorithm::AesGcm, opts.key_provider.handle.clone())
+        });
+
         Self {
             inner: Arc::new(Mutex::new(ManagerInner {
                 enabled: options.is_some(), // Enabled by default if options is provided
+                dc_encryption_enabled: options.is_some() && with_dc_encryption,
                 options,
                 frame_cryptors: HashMap::new(),
+                data_packet_cryptor,
             })),
             state_changed: Default::default(),
         }
@@ -79,48 +108,93 @@ impl E2eeManager {
         self.inner.lock().options.is_some()
     }
 
-    /// Called by the room
     pub(crate) fn on_track_subscribed(
         &self,
         track: RemoteTrack,
         publication: RemoteTrackPublication,
         participant: RemoteParticipant,
     ) {
-        if !self.initialized() {
-            return;
-        }
-
-        if publication.encryption_type() == EncryptionType::None {
-            return;
-        }
-
         let identity = participant.identity();
         let receiver = track.transceiver().unwrap().receiver();
+        let mut packet_trailer_handler = None;
+
+        let needs_packet_trailer_handler = needs_video_receiver_packet_trailer_handler(
+            &publication.proto_info().packet_trailer_features,
+        );
+
+        if let RemoteTrack::Video(video_track) = &track {
+            if needs_packet_trailer_handler {
+                let handler = packet_trailer::create_receiver_handler(
+                    LkRuntime::instance().pc_factory(),
+                    &receiver,
+                );
+                video_track.set_packet_trailer_handler(handler.clone());
+                packet_trailer_handler = Some(handler);
+                log::info!(
+                    "attached packet_trailer handler for subscribed track {} from {}",
+                    publication.sid(),
+                    identity,
+                );
+            } else {
+                log::debug!(
+                    "skipping packet_trailer handler for subscribed track {} from {} without advertised packet trailer support",
+                    publication.sid(),
+                    identity,
+                );
+            }
+        }
+
+        if !self.initialized() || publication.encryption_type() == EncryptionType::None {
+            return;
+        }
+
         let frame_cryptor = self.setup_rtp_receiver(&identity, receiver);
+        if let Some(handler) = packet_trailer_handler.as_ref() {
+            frame_cryptor.set_packet_trailer_handler(handler);
+        }
         self.setup_cryptor(&frame_cryptor);
 
         let mut inner = self.inner.lock();
         inner.frame_cryptors.insert((identity, publication.sid()), frame_cryptor.clone());
     }
 
-    /// Called by the room
     pub(crate) fn on_local_track_published(
         &self,
         track: LocalTrack,
         publication: LocalTrackPublication,
         participant: LocalParticipant,
     ) {
-        if !self.initialized() {
-            return;
-        }
-
-        if publication.encryption_type() == EncryptionType::None {
-            return;
-        }
-
         let identity = participant.identity();
         let sender = track.transceiver().unwrap().sender();
+
+        let packet_trailer_handler = if let LocalTrack::Video(video_track) = &track {
+            let handler = video_track.packet_trailer_handler();
+            if handler.is_some() {
+                log::info!(
+                    "packet_trailer enabled for published track {} from {}",
+                    publication.sid(),
+                    identity,
+                );
+            } else {
+                log::info!(
+                    "packet_trailer not enabled for published track {} from {}",
+                    publication.sid(),
+                    identity,
+                );
+            }
+            handler
+        } else {
+            None
+        };
+
+        if !self.initialized() || publication.encryption_type() == EncryptionType::None {
+            return;
+        }
+
         let frame_cryptor = self.setup_rtp_sender(&identity, sender);
+        if let Some(handler) = packet_trailer_handler.as_ref() {
+            frame_cryptor.set_packet_trailer_handler(handler);
+        }
         self.setup_cryptor(&frame_cryptor);
 
         let mut inner = self.inner.lock();
@@ -163,12 +237,17 @@ impl E2eeManager {
         self.inner.lock().enabled && self.initialized()
     }
 
+    pub fn is_dc_encryption_enabled(&self) -> bool {
+        self.inner.lock().dc_encryption_enabled
+    }
+
     pub fn set_enabled(&self, enabled: bool) {
-        let inner = self.inner.lock();
+        let mut inner = self.inner.lock();
         if inner.enabled == enabled {
             return;
         }
 
+        inner.enabled = enabled;
         for (_, cryptor) in inner.frame_cryptors.iter() {
             cryptor.set_enabled(enabled);
         }
@@ -227,5 +306,81 @@ impl E2eeManager {
 
         let mut inner = self.inner.lock();
         inner.frame_cryptors.remove(&(participant_identity, track_sid));
+    }
+
+    /// Decrypt data received from a data channel
+    pub(crate) fn decrypt_data(
+        &self,
+        data: Vec<u8>,
+        iv: Vec<u8>,
+        key_index: u32,
+        participant_identity: &str,
+    ) -> Option<Vec<u8>> {
+        let inner = self.inner.lock();
+
+        let data_packet_cryptor = inner.data_packet_cryptor.as_ref()?;
+
+        let encrypted_packet = EncryptedPacket { data, iv, key_index };
+        match data_packet_cryptor.decrypt(participant_identity, &encrypted_packet) {
+            Ok(decrypted_data) => Some(decrypted_data),
+            Err(e) => {
+                log::warn!("handle_encrypted_data error: {}", e);
+                None
+            }
+        }
+    }
+
+    /// Encrypt data for transmission over a data channel
+    pub(crate) fn encrypt_data(
+        &self,
+        data: Vec<u8>,
+        participant_identity: &ParticipantIdentity,
+        key_index: u32,
+    ) -> Result<EncryptedPacket, Box<dyn std::error::Error>> {
+        let inner = self.inner.lock();
+
+        let data_packet_cryptor =
+            inner.data_packet_cryptor.as_ref().ok_or("DataPacketCryptor is not initialized")?;
+
+        data_packet_cryptor.encrypt(participant_identity.as_str(), key_index, &data)
+    }
+}
+
+impl Debug for E2eeManager {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("E2eeManager")
+            .field("enabled", &self.inner.lock().enabled)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receiver_packet_trailer_handler_is_skipped_without_features() {
+        assert!(!needs_video_receiver_packet_trailer_handler(&[]));
+    }
+
+    #[test]
+    fn receiver_packet_trailer_handler_is_needed_for_user_timestamp() {
+        let features = [PacketTrailerFeature::PtfUserTimestamp as i32];
+
+        assert!(needs_video_receiver_packet_trailer_handler(&features));
+    }
+
+    #[test]
+    fn receiver_packet_trailer_handler_is_needed_for_frame_id() {
+        let features = [PacketTrailerFeature::PtfFrameId as i32];
+
+        assert!(needs_video_receiver_packet_trailer_handler(&features));
+    }
+
+    #[test]
+    fn receiver_packet_trailer_handler_is_needed_for_user_data() {
+        let features = [PacketTrailerFeature::PtfUserData as i32];
+
+        assert!(needs_video_receiver_packet_trailer_handler(&features));
     }
 }
