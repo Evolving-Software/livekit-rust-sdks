@@ -170,6 +170,7 @@ impl RawStream {
             .map_err(|_| StreamError::SendFailed) // data channel error
     }
 
+    #[allow(deprecated)]
     pub(crate) fn create_header_packet(
         header: proto::data_stream::Header,
         destination_identities: Vec<ParticipantIdentity>,
@@ -184,6 +185,7 @@ impl RawStream {
         }
     }
 
+    #[allow(deprecated)]
     pub(crate) fn create_chunk_packet(
         id: &str,
         chunk_index: u64,
@@ -203,6 +205,7 @@ impl RawStream {
         }
     }
 
+    #[allow(deprecated)]
     pub(crate) fn create_trailer_packet(
         id: &str,
         reason: Option<&str>,

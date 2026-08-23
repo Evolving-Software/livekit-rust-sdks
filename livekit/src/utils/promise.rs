@@ -54,6 +54,7 @@ impl<T: Clone> Promise<T> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn try_result(&self) -> Option<T> {
         self.result.try_read().ok().and_then(|result| result.clone())
     }

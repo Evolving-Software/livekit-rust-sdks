@@ -142,12 +142,14 @@ impl LkRuntime {
 
     /// Set the playout device by index
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
     pub(crate) fn set_playout_device(&self, index: u16) -> bool {
         self.pc_factory.set_playout_device(index)
     }
 
     /// Set the recording device by index
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
     pub(crate) fn set_recording_device(&self, index: u16) -> bool {
         self.pc_factory.set_recording_device(index)
     }
@@ -265,6 +267,7 @@ impl LkRuntime {
 
     /// Check if ADM recording (microphone) is enabled.
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
     pub(crate) fn adm_recording_enabled(&self) -> bool {
         self.pc_factory.adm_recording_enabled()
     }
@@ -281,6 +284,7 @@ impl LkRuntime {
 
     /// Check if ADM playout (speakers) is enabled.
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
     pub(crate) fn adm_playout_enabled(&self) -> bool {
         self.pc_factory.adm_playout_enabled()
     }
@@ -316,6 +320,7 @@ impl LkRuntime {
 
     /// Returns true if Platform ADM is currently active (ref_count > 0).
     #[cfg(not(target_arch = "wasm32"))]
+    #[allow(dead_code)]
     pub(crate) fn is_platform_adm_active(&self) -> bool {
         self.pc_factory.is_platform_adm_active()
     }

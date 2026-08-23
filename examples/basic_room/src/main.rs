@@ -361,7 +361,7 @@ async fn main() {
 
     // Disconnect from the room gracefully
     log::info!("Disconnecting from room...");
-    room.close().await;
+    let _ = room.close().await;
     log::info!("Disconnected. Goodbye!");
 }
 

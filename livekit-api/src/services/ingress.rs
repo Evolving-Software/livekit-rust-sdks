@@ -106,6 +106,7 @@ impl IngressClient {
         self
     }
 
+    #[allow(deprecated)]
     pub async fn create_ingress(
         &self,
         input_type: proto::IngressInput,
@@ -136,6 +137,7 @@ impl IngressClient {
             .map_err(Into::into)
     }
 
+    #[allow(deprecated)]
     pub async fn update_ingress(
         &self,
         ingress_id: &str,

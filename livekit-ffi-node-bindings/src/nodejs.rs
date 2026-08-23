@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![allow(deprecated)]
+
 use livekit_ffi::{proto, server, FFI_SERVER};
 use napi::{
     bindgen_prelude::*,
@@ -134,7 +136,7 @@ impl FfiHandle {
 }
 
 impl ObjectFinalize for FfiHandle {
-    fn finalize(mut self, env: Env) -> Result<()> {
+    fn finalize(mut self, _env: Env) -> Result<()> {
         self.dispose()
     }
 }

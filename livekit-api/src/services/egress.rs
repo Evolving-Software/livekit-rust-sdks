@@ -468,6 +468,7 @@ pub mod encoding {
         pub video_quality: i32,
     }
 
+    #[allow(deprecated)]
     impl From<EncodingOptions> for proto::EncodingOptions {
         fn from(opts: EncodingOptions) -> Self {
             Self {

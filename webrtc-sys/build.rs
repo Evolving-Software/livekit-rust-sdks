@@ -218,7 +218,7 @@ fn main() {
                         ["va", "va-drm"].map(String::from).to_vec(),
                     );
                 } else {
-                    println!("cargo:warning=libva not found; building without hardware accelerated video codecs");
+                    println!("cargo:info=libva not found; building without hardware accelerated video codecs");
                 }
             }
 
@@ -254,7 +254,7 @@ fn main() {
                             builder.file(&src_path);
                         } else {
                             println!(
-                                "cargo:warning=Jetson MMAPI source not found: {}",
+                                "cargo:info=Jetson MMAPI source not found: {}",
                                 src_path.display()
                             );
                         }
@@ -306,7 +306,7 @@ fn main() {
                         ["cuda", "nvcuvid"].map(String::from).to_vec(),
                     );
                 } else {
-                    println!("cargo:warning=cuda.h not found; building without hardware accelerated video codec support for NVidia GPUs");
+                    println!("cargo:info=cuda.h not found; building without hardware accelerated video codec support for NVidia GPUs");
                 }
             }
 

@@ -43,6 +43,7 @@ impl<K, V> TtlMap<K, V> {
     }
 
     /// Returns the number of elements in the map.
+    #[allow(dead_code)]
     pub fn len(&mut self) -> usize {
         self.cleanup();
         self.inner.len()

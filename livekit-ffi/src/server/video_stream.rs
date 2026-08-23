@@ -226,7 +226,7 @@ impl FfiVideoStream {
         let normalize_stride = request.normalize_stride.unwrap_or(true);
         let queue_size_frames = request.queue_size_frames.map(|capacity| capacity as usize);
         let (track_tx, mut track_rx) = mpsc::channel::<Track>(1);
-        let (track_finished_tx, track_finished_rx) = broadcast::channel::<Track>(1);
+        let (track_finished_tx, _track_finished_rx) = broadcast::channel::<Track>(1);
         server.async_runtime.spawn(utils::track_changed_trigger(
             ffi_participant,
             track_source.into(),

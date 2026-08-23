@@ -1,11 +1,10 @@
-use futures_util::TryStreamExt;
 use livekit::{
     e2ee::{
         key_provider::{KeyProvider, KeyProviderOptions},
-        E2eeOptions, EncryptionType,
+        E2eeOptions,
     },
     prelude::*,
-    SimulateScenario, StreamReader, StreamTextOptions, TextStreamReader,
+    StreamReader, StreamTextOptions,
 };
 use livekit_api::access_token;
 use std::{env, error::Error, io::Write};
@@ -113,7 +112,7 @@ async fn run_interactive_chat(
                 match event {
                     Some(RoomEvent::TextStreamOpened { reader, topic, participant_identity }) => {
                         if topic == "lk.chat" {
-                            if let Some(mut reader) = reader.take() {
+                            if let Some(reader) = reader.take() {
                                 match reader.read_all().await {
                                     Ok(message) => {
                                         println!("📨 {} (decrypted): {}", participant_identity, message);

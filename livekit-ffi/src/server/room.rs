@@ -16,8 +16,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 use std::{collections::HashSet, slice, sync::Arc};
 
+use livekit::StreamReader;
 use livekit::{prelude::*, registered_audio_filter_plugins, PluginError};
-use livekit::{ChatMessage, StreamReader};
 use livekit_protocol as lk_proto;
 use parking_lot::Mutex;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex as AsyncMutex, Notify};
@@ -1388,7 +1388,7 @@ async fn forward_event(
                 data_ptr: payload.as_ptr() as u64,
                 data_len: payload.len() as u64,
             };
-            let (sid, identity) = match participant {
+            let (_sid, identity) = match participant {
                 Some(p) => (Some(p.sid().to_string()), p.identity().to_string()),
                 None => (None, String::new()),
             };

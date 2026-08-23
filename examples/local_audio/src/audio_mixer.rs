@@ -5,7 +5,9 @@ use tokio::sync::mpsc;
 #[derive(Clone)]
 pub struct AudioMixer {
     buffer: Arc<Mutex<std::collections::VecDeque<i16>>>,
+    #[allow(dead_code)]
     sample_rate: u32,
+    #[allow(dead_code)]
     channels: u32,
     volume: f32,
     max_buffer_size: usize,
@@ -15,6 +17,7 @@ pub struct AudioMixer {
 }
 
 impl AudioMixer {
+    #[allow(dead_code)]
     pub fn new(sample_rate: u32, channels: u32, volume: f32) -> Self {
         // Buffer for 1 second of audio
         let max_buffer_size = sample_rate as usize * channels as usize;
@@ -32,6 +35,7 @@ impl AudioMixer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn with_db_meter(
         sample_rate: u32,
         channels: u32,

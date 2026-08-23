@@ -74,6 +74,7 @@ pub fn registered_audio_filter_plugins() -> Vec<Arc<AudioFilterPlugin>> {
 }
 
 pub struct AudioFilterPlugin {
+    #[allow(dead_code)]
     lib: Library,
     dependencies: Vec<Library>,
     on_load_fn_ptr: *const c_void,

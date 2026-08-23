@@ -243,6 +243,7 @@ fn find_output_device_by_name(name: &str) -> Result<Device> {
     Err(anyhow!("Output device '{}' not found", name))
 }
 
+#[allow(dead_code)]
 async fn stream_audio_to_livekit(
     mut audio_rx: mpsc::UnboundedReceiver<Vec<i16>>,
     livekit_source: NativeAudioSource,

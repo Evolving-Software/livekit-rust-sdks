@@ -45,12 +45,14 @@ pub enum RtcEvent {
     // TODO (theomonnom): Move Offer to PeerTransport
     Offer {
         offer: SessionDescription,
+        #[allow(dead_code)]
         target: proto::SignalTarget,
     },
     Track {
         streams: Vec<MediaStream>,
         track: MediaStreamTrack,
         transceiver: RtpTransceiver,
+        #[allow(dead_code)]
         target: proto::SignalTarget,
     },
     Data {
@@ -60,6 +62,7 @@ pub enum RtcEvent {
     },
     DataChannelBufferedAmountChange {
         sent: u64,
+        #[allow(dead_code)]
         amount: u64,
         kind: DataPacketKind,
     },

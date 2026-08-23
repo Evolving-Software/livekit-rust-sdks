@@ -382,6 +382,7 @@ impl LocalParticipant {
     ) -> RoomResult<LocalTrackPublication> {
         let disable_red = self.local.encryption_type != EncryptionType::None || !options.red;
 
+        #[allow(deprecated)]
         let mut req = proto::AddTrackRequest {
             cid: track.rtc_track().id(),
             name: track.name(),
@@ -707,6 +708,7 @@ impl LocalParticipant {
         };
         let destination_identities: Vec<String> =
             packet.destination_identities.into_iter().map(Into::into).collect();
+        #[allow(deprecated)]
         let data = proto::DataPacket {
             kind: kind as i32,
             destination_identities: destination_identities.clone(),

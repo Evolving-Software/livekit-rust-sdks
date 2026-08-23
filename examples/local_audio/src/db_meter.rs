@@ -180,6 +180,7 @@ fn display_meters(mic_db: f32, room_db: f32, first_display: &mut bool) {
 }
 
 /// Display the dB meter continuously (legacy single meter function for compatibility)
+#[allow(dead_code)]
 pub async fn display_db_meter(mut db_rx: mpsc::UnboundedReceiver<f32>) -> Result<()> {
     let mut last_update = std::time::Instant::now();
     let mut current_db = -60.0f32;

@@ -394,15 +394,14 @@ fn on_local_track_mute(
 ) -> FfiResult<proto::LocalTrackMuteResponse> {
     let ffi_track = server.retrieve_handle::<FfiTrack>(request.track_handle)?.clone();
 
-    let mut muted = false;
-    match ffi_track.track {
+    let muted = match ffi_track.track {
         Track::LocalAudio(track) => {
             if request.mute {
                 track.mute();
             } else {
                 track.unmute();
             }
-            muted = track.is_muted();
+            track.is_muted()
         }
         Track::LocalVideo(track) => {
             if request.mute {
@@ -410,12 +409,12 @@ fn on_local_track_mute(
             } else {
                 track.unmute();
             }
-            muted = track.is_muted();
+            track.is_muted()
         }
         _ => return Err(FfiError::InvalidRequest("track is not a local track".into())),
-    }
+    };
 
-    Ok(proto::LocalTrackMuteResponse { muted: muted })
+    Ok(proto::LocalTrackMuteResponse { muted })
 }
 
 fn on_enable_remote_track(
@@ -424,15 +423,14 @@ fn on_enable_remote_track(
 ) -> FfiResult<proto::EnableRemoteTrackResponse> {
     let ffi_track = server.retrieve_handle::<FfiTrack>(request.track_handle)?.clone();
 
-    let mut enabled = false;
-    match ffi_track.track {
+    let enabled = match ffi_track.track {
         Track::RemoteAudio(track) => {
             if request.enabled {
                 track.enable();
             } else {
                 track.disable();
             }
-            enabled = track.is_enabled();
+            track.is_enabled()
         }
         Track::RemoteVideo(track) => {
             if request.enabled {
@@ -440,12 +438,12 @@ fn on_enable_remote_track(
             } else {
                 track.disable();
             }
-            enabled = track.is_enabled();
+            track.is_enabled()
         }
         _ => return Err(FfiError::InvalidRequest("track is not a remote track".into())),
-    }
+    };
 
-    Ok(proto::EnableRemoteTrackResponse { enabled: enabled })
+    Ok(proto::EnableRemoteTrackResponse { enabled })
 }
 
 /// Retrieve the stats from a track

@@ -456,6 +456,7 @@ pub struct RoomOptions {
 }
 
 impl Default for RoomOptions {
+    #[allow(deprecated)]
     fn default() -> Self {
         Self {
             auto_subscribe: true,
@@ -568,6 +569,7 @@ impl Room {
         // TODO(theomonnom): move connection logic to the RoomSession
 
         let with_dc_encryption = options.encryption.is_some();
+        #[allow(deprecated)]
         let encryption_options = options.encryption.take().or(options.e2ee.take());
         let e2ee_manager = E2eeManager::new(encryption_options, with_dc_encryption);
 
@@ -1913,6 +1915,7 @@ impl RoomSession {
         // Back-compat raw-header event (non-internal topics only). The header topic alone
         // determines internal-ness, so it's gated here without consulting the actor.
         if !is_internal_topic(&header.topic) {
+            #[allow(deprecated)]
             let event = RoomEvent::StreamHeaderReceived {
                 header: header.clone(),
                 participant_identity: participant_identity.clone(),
@@ -2430,11 +2433,13 @@ async fn incoming_data_stream_task(
                 // topic of the stream they belong to for the internal check below.
                 ds::incoming::OutputEvent::ChunkReceived(ds::incoming::ChunkReceived { chunk, participant_identity, topic }) => {
                     if !topic.as_deref().is_some_and(is_internal_topic) {
+                        #[allow(deprecated)]
                         dispatcher.dispatch(&RoomEvent::StreamChunkReceived { chunk: chunk.into(), participant_identity: participant_identity.into() });
                     }
                 }
                 ds::incoming::OutputEvent::TrailerReceived(ds::incoming::TrailerReceived { trailer, participant_identity, topic }) => {
                     if !topic.as_deref().is_some_and(is_internal_topic) {
+                        #[allow(deprecated)]
                         dispatcher.dispatch(&RoomEvent::StreamTrailerReceived { trailer: trailer.into(), participant_identity: participant_identity.into() });
                     }
                 }

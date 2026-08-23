@@ -77,18 +77,17 @@ impl<R: AsyncRead + AsyncSeek + Unpin> WavReader<R> {
         let block_align = self.reader.read_u16_le().await?;
         let bits_per_sample = self.reader.read_u16_le().await?;
 
-        let mut data_size = 0;
-        loop {
+        let data_size = loop {
             self.reader.read_exact(&mut data_chunk).await?;
-            data_size = self.reader.read_u32_le().await?;
+            let data_size = self.reader.read_u32_le().await?;
 
             if &data_chunk == b"data" {
-                break;
+                break data_size;
             } else {
                 // skip non data chunks
                 self.reader.seek(SeekFrom::Current(data_size.into())).await?;
             }
-        }
+        };
 
         if &data_chunk != b"data" {
             return Err(WavError::InvalidHeader("Invalid data chunk"));

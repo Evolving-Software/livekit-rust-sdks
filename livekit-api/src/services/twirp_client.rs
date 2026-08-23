@@ -134,6 +134,7 @@ pub struct TwirpClient {
 }
 
 impl TwirpClient {
+    #[cfg(test)]
     pub fn new(host: &str, pkg: &str, prefix: Option<&str>) -> Self {
         Self::with_client(host, pkg, prefix, http_client::Client::new())
     }

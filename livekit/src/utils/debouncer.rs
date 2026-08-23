@@ -15,14 +15,7 @@
 use std::time::Duration;
 
 use futures_util::Future;
-use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
-
-#[derive(Debug, Error)]
-pub enum DebounceError {
-    #[error("function already executed")]
-    AlreadyExecuted,
-}
 
 pub struct Debouncer {
     cancel_tx: Option<oneshot::Sender<()>>,

@@ -1,6 +1,6 @@
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 mod test {
-    use clap::{ArgAction, Parser};
+    use clap::Parser;
     use livekit::options::{TrackPublishOptions, VideoCodec};
     use livekit::prelude::*;
     use livekit::track::{LocalTrack, LocalVideoTrack, TrackSource};

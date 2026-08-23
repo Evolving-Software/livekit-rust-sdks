@@ -3,11 +3,8 @@ use livekit_api::access_token;
 use rand::Rng;
 use serde_json::{json, Value};
 use std::env;
+use std::sync::Arc;
 use std::sync::Once;
-use std::sync::{
-    atomic::{AtomicU64, Ordering},
-    Arc,
-};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -45,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let api_key = env::var("LIVEKIT_API_KEY").expect("LIVEKIT_API_KEY is not set");
     let api_secret = env::var("LIVEKIT_API_SECRET").expect("LIVEKIT_API_SECRET is not set");
 
-    let room_name = format!("rpc-test-{:x}", rand::thread_rng().gen::<u32>());
+    let room_name = format!("rpc-test-{:x}", rand::rng().random::<u32>());
     println!("[{}] Connecting participants to room: {}", elapsed_time(), room_name);
 
     let (callers_room, greeters_room, math_genius_room) = tokio::try_join!(
@@ -172,7 +169,7 @@ async fn register_receiver_methods(greeters_room: Arc<Room>, math_genius_room: A
                         );
                         Ok(json!({"result": final_result}).to_string())
                     }
-                    Err(e) => Err(RpcError {
+                    Err(_e) => Err(RpcError {
                         code: 1,
                         message: "Failed to get intermediate result".to_string(),
                         data: None,

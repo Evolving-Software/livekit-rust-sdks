@@ -655,10 +655,6 @@ impl EngineInner {
                     segments,
                 });
             }
-            SessionEvent::SipDTMF { participant_identity, code, digit } => {
-                let _ =
-                    self.engine_tx.send(EngineEvent::SipDTMF { participant_identity, code, digit });
-            }
             SessionEvent::RpcRequest {
                 caller_identity,
                 request_id,
@@ -783,7 +779,7 @@ impl EngineInner {
     /// When waiting for reconnection, it ensures we're always using the latest session.
     async fn wait_reconnection(
         &self,
-    ) -> EngineResult<(RwLockReadGuard<EngineHandle>, AsyncRwLockReadGuard<()>)> {
+    ) -> EngineResult<(RwLockReadGuard<'_, EngineHandle>, AsyncRwLockReadGuard<'_, ()>)> {
         let r_lock = self.reconnecting_lock.read().await;
         let running_handle = self.running_handle.read();
 
